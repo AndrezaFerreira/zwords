@@ -159,8 +159,8 @@ enum Highlighter {
         guard let range = Lemmatizer.range(of: word, at: nil, in: sentence),
               let lower = AttributedString.Index(range.lowerBound, within: attributed),
               let upper = AttributedString.Index(range.upperBound, within: attributed) else { return attributed }
-        attributed[lower..<upper].font = .body.bold()
-        attributed[lower..<upper].foregroundColor = .accentColor
+        attributed[lower..<upper].font = Font.body.bold()
+        attributed[lower..<upper].foregroundColor = Color.accentColor
         return attributed
     }
 }

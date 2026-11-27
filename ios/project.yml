@@ -50,6 +50,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(ZW_BUNDLE_PREFIX)
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # Apple Intelligence (iOS 26) is optional: keep the app launching on iOS 18.
+        OTHER_LDFLAGS: ["$(inherited)", "-weak_framework", "FoundationModels"]
     dependencies:
       - target: ZWordsBroadcast
   ZWordsBroadcast:

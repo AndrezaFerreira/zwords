@@ -25,7 +25,7 @@ final class MicCapture {
     }
 
     func stop() {
-        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
