@@ -43,6 +43,7 @@ jobs:
           c=[x for r,l in d.items() if "iOS" in r for x in l if x["name"].startswith("iPhone")]
           print(c[-1]["udid"])')
           echo "Simulator: $UDID"
+          mkdir -p build
           set -o pipefail
           xcodebuild test -project ZWords.xcodeproj -scheme ZWords \
             -destination "id=$UDID" -derivedDataPath build/test \
