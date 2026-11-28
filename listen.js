@@ -111,25 +111,37 @@
      * Breaks a long run-on transcript (Safari often returns whole paragraphs
      * without punctuation) into subtitle-sized pieces, at natural joints.
      */
+    // Never cut right after these ("…about it I | figure…") nor right before a
+    // particle ("dug | around"): both pieces would lose their meaning.
+    const NO_BREAK_AFTER = new Set(("i you we they he she it the a an to of my your his her our their its this that "
+        + "these those can could will would should must may might don't didn't doesn't can't won't wouldn't "
+        + "i'm you're we're they're he's she's it's i've i'd i'll is are was were be been not very really just "
+        + "kind sort about with for at in on from by into like").split(" "));
+    const NO_BREAK_BEFORE = new Set("up down out off around away back over about along in on at to of with for".split(" "));
+    const bare = word => word.toLowerCase().replace(/[^a-z']/g, "");
+
+    function isJoint(words, j) {
+        return BREAK_BEFORE.has(bare(words[j])) || /[,;:.!?]["”')]?$/.test(words[j - 1]);
+    }
+
+    function canBreak(words, j) {
+        return !NO_BREAK_AFTER.has(bare(words[j - 1])) && !NO_BREAK_BEFORE.has(bare(words[j]));
+    }
+
     function chunkSentence(text) {
         const words = text.split(/\s+/).filter(Boolean);
         if (words.length <= 24) return [text];
         const out = [];
-        let current = [];
-        words.forEach(word => {
-            const bare = word.toLowerCase().replace(/[^a-z']/g, "");
-            const atJoint = current.length >= 10
-                && (BREAK_BEFORE.has(bare) || /[,;:]$/.test(current[current.length - 1]));
-            if (current.length >= 20 || atJoint) {
-                out.push(current.join(" "));
-                current = [];
-            }
-            current.push(word);
-        });
-        if (current.length) {
-            if (current.length < 5 && out.length) out[out.length - 1] += " " + current.join(" ");
-            else out.push(current.join(" "));
+        let start = 0;
+        while (words.length - start > 24) {
+            let cut = -1;
+            for (let j = start + 20; j >= start + 10 && cut < 0; j--) if (isJoint(words, j) && canBreak(words, j)) cut = j;
+            for (let j = start + 20; j >= start + 10 && cut < 0; j--) if (canBreak(words, j)) cut = j;
+            if (cut < 0) cut = start + 20;
+            out.push(words.slice(start, cut).join(" "));
+            start = cut;
         }
+        out.push(words.slice(start).join(" "));
         return out;
     }
 
@@ -621,6 +633,11 @@
         return { pos: "", lead: "" };
     }
 
+    function hintFields(tokens, index) {
+        const hint = contextHint(tokens, index);
+        return { posHint: hint.pos, lead: hint.lead };
+    }
+
     /** What a tap means: a phrasal verb/expression around the word, or the word itself. */
     async function resolveTarget(tokens, index) {
         const phrase = await Phrasal.find(tokens, index).catch(() => null);
@@ -757,7 +774,7 @@
     // Bump whenever the way meanings/phrasal verbs are chosen improves: every
     // word already in the library is then re-checked automatically, so nobody
     // keeps studying a meaning the old logic got wrong.
-    const MEANING_VERSION = 3;
+    const MEANING_VERSION = 4;
 
     function newRecord(target, now) {
         return {
@@ -787,6 +804,7 @@
                     definition: "",
                     pos: "",
                     tap: target.tap,
+                    ...(target.full ? { full: target.full, fullTap: target.fullTap } : {}),
                     at: now
                 });
             }
@@ -900,10 +918,12 @@
         const record = await Store.get(key);
         const context = record?.contexts.find(c => c.sentence === sentence);
         if (!context) return false;
-        const fullTokens = tokenize(sentence);
+        const original = context.full || sentence;
+        const fullTokens = tokenize(original);
         const first = normalizeWord(String(context.form).split(" ")[0]);
-        const fullIndex = Number.isInteger(context.tap) && fullTokens[context.tap]?.w
-            ? context.tap
+        const savedTap = context.full ? context.fullTap : context.tap;
+        const fullIndex = Number.isInteger(savedTap) && fullTokens[savedTap]?.w
+            ? savedTap
             : fullTokens.findIndex(t => t.w === first);
         if (fullIndex < 0) {
             context.mv = MEANING_VERSION;           // cannot locate the word: keep as is
@@ -911,11 +931,12 @@
             return false;
         }
         // Long run-on transcripts are reduced to the piece around the word.
-        const focus = focusSentence(sentence, fullIndex);
+        const focus = focusSentence(original, fullIndex);
         const shortened = focus.sentence !== sentence;
         const index = focus.index;
         const tokens = tokenize(focus.sentence);
         const target = await resolveTarget(tokens, index);
+        if (!target.isPhrase && focus.sentence !== original) Object.assign(target, hintFields(fullTokens, fullIndex));
         const translation = shortened
             ? await Translate.sentence(focus.sentence)
             : (context.translation || await Translate.sentence(sentence));
@@ -933,6 +954,7 @@
             pos: meaning.pos,
             senseId: meaning.senseId,
             tap: index,
+            ...(focus.sentence !== original ? { full: original, fullTap: fullIndex } : {}),
             mv: MEANING_VERSION
         };
 
@@ -1155,6 +1177,11 @@
 
         const target = await resolveTarget(tokens, index);
         target.tap = index;
+        if (sentence !== fullSentence) {
+            target.full = fullSentence;
+            target.fullTap = tapped;
+            if (!target.isPhrase) Object.assign(target, hintFields(tokenize(fullSentence), tapped));
+        }
         const spans = target.positions
             .map(position => lineEl.querySelector(`.w[data-i="${position + offset}"]`))
             .filter(Boolean);
