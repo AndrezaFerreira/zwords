@@ -339,6 +339,33 @@
             return positions;
         }
 
+        // Particles that almost always make a phrasal verb right after a verb
+        // ("dug around", "freaked out"). Prepositions like in/on/at/to are left
+        // out on purpose: "sat on the chair" is not a phrasal verb.
+        const LOOSE_PARTICLES = new Set(["up", "down", "out", "off", "around", "round", "about", "away",
+            "back", "over", "along", "aside", "apart", "together", "forward", "ahead"]);
+
+        const DETERMINERS = new Set(["the", "a", "an", "this", "that", "these", "those", "my", "your", "his",
+            "her", "its", "our", "their", "some", "any", "every", "each", "no"]);
+
+        /** Verb + particle not in the dictionary yet ("dig around"). */
+        async function looseMatch(tokens, index) {
+            const tapped = tokens[index].w;
+            let verbAt = -1;
+            if (LOOSE_PARTICLES.has(tapped) && index > 0 && !breaksBefore(tokens, index)) verbAt = index - 1;
+            else if (tokens[index + 1]?.w && LOOSE_PARTICLES.has(tokens[index + 1].w) && !breaksBefore(tokens, index + 1)) verbAt = index;
+            if (verbAt < 0 || !tokens[verbAt].w) return null;
+            const word = tokens[verbAt].w;
+            if (DETERMINERS.has(tokens[verbAt - 1]?.w)) return null;      // "the house around…" is a noun
+            const { key: verb, entry } = await Dict.lemma(word);
+            if (!entry) return null;
+            const senses = entry[1].map(([pos]) => String(pos).toLowerCase());
+            const inflected = verb !== word;                                  // "dug", "freaked", "walking"
+            if (!(senses[0] === "verb" || (inflected && senses.includes("verb")))) return null;
+            const particle = tokens[verbAt + 1].w;
+            return { score: 0, display: `${verb} ${particle}`, pattern: [verb, particle], senses: [], positions: [verbAt, verbAt + 1] };
+        }
+
         /** The longest known expression that includes the tapped word, or null. */
         async function find(tokens, index) {
             if (!tokens[index]?.w) return null;
@@ -359,6 +386,7 @@
                     if (!best || score > best.score) best = { score, display, pattern, senses, positions };
                 }
             }
+            if (!best) best = await looseMatch(tokens, index);
             if (!best) return null;
             const first = best.positions[0];
             const last = best.positions[best.positions.length - 1];
