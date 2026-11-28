@@ -26,7 +26,6 @@
         mic: $("micButton"),
         micLabel: $("micLabel"),
         notice: $("notice"),
-        toast: $("toast"),
         jumpLive: $("jumpLive"),
         libraryCount: $("libraryCount"),
         library: $("library"),
@@ -280,6 +279,105 @@
 
 
     // ============================================================
+    // PHRASAL VERBS & EXPRESSIONS (ZWords decks, data/listen/phrasal.json)
+    // ============================================================
+
+    const Phrasal = (() => {
+        let promise = null;
+        const POSSESSIVES = new Set(["my", "your", "his", "her", "its", "our", "their", "one's"]);
+        const REFLEXIVES = new Set(["myself", "yourself", "himself", "herself", "itself", "ourselves", "yourselves", "themselves", "oneself"]);
+        // Only adverb particles let an object sit before them ("turn it off", "pick the kids up").
+        const SEPARABLE = new Set(["up", "down", "out", "off", "in", "on", "back", "away", "over", "around", "round",
+            "about", "through", "along", "together", "apart", "aside", "forward", "across", "by", "behind", "ahead"]);
+
+        function load() {
+            if (!promise) {
+                promise = fetchWithTimeout("data/listen/phrasal.json", 15000)
+                    .then(r => (r.ok ? r.json() : {}))
+                    .catch(() => { promise = null; return {}; });
+            }
+            return promise;
+        }
+
+        const matches = (item, word) => item.split("/").includes(word);
+
+        function breaksBefore(tokens, position) {
+            return position > 0 && /[.,!?;:—]["”')]?$/.test(tokens[position - 1].t);
+        }
+
+        function matchAt(tokens, start, pattern) {
+            const positions = [start];
+            let from = start + 1;
+            let gap = 0;
+            let minGap = 0;
+            for (let k = 1; k < pattern.length; k++) {
+                const item = pattern[k];
+                if (item === "~") {
+                    gap = 4;
+                    minGap = 1;
+                    continue;
+                }
+                if (k === 1 && gap === 0 && SEPARABLE.has(item.split("/")[0])) gap = 2;
+                let found = -1;
+                for (let p = from; p < tokens.length && p <= from + gap; p++) {
+                    if (breaksBefore(tokens, p) || !tokens[p].w) break;
+                    const w = tokens[p].w;
+                    const ok = item === "@" ? POSSESSIVES.has(w)
+                        : item === "#" ? REFLEXIVES.has(w)
+                        : matches(item, w);
+                    if (ok && p - from >= minGap) {
+                        found = p;
+                        break;
+                    }
+                }
+                if (found < 0) return null;
+                positions.push(found);
+                from = found + 1;
+                gap = 0;
+                minGap = 0;
+            }
+            return positions;
+        }
+
+        /** The longest known expression that includes the tapped word, or null. */
+        async function find(tokens, index) {
+            if (!tokens[index]?.w) return null;
+            const table = await load();
+            let best = null;
+            for (let start = Math.max(0, index - 7); start <= index; start++) {
+                const word = tokens[start].w;
+                if (!word) continue;
+                const { key: lemma } = await Dict.lemma(word);
+                const firsts = new Set([word, lemma]);
+                const candidates = [];
+                firsts.forEach(first => (table[first] || []).forEach(c => candidates.push(c)));
+                for (const [display, pattern, senses] of candidates) {
+                    const positions = matchAt(tokens, start, pattern);
+                    if (!positions || !positions.includes(index)) continue;
+                    const literals = pattern.filter(item => !"~@#".includes(item)).length;
+                    const score = literals * 10 - (positions[positions.length - 1] - positions[0]);
+                    if (!best || score > best.score) best = { score, display, pattern, senses, positions };
+                }
+            }
+            if (!best) return null;
+            const first = best.positions[0];
+            const last = best.positions[best.positions.length - 1];
+            return {
+                isPhrase: true,
+                key: best.display.toLowerCase(),
+                headword: best.display,
+                form: tokens.slice(first, last + 1).map(t => t.w || t.t).join(" "),
+                lookup: best.pattern.filter(item => !"~@#".includes(item)).map(item => item.split("/")[0]).join(" "),
+                senses: best.senses,
+                positions: best.positions
+            };
+        }
+
+        return { find, load };
+    })();
+
+
+    // ============================================================
     // TRANSLATION (free; on-device when the browser offers it)
     // ============================================================
 
@@ -433,18 +531,34 @@
         return POS_PT[String(pos || "").toLowerCase()] || pos || "";
     }
 
+    /** What a tap means: a phrasal verb/expression around the word, or the word itself. */
+    async function resolveTarget(tokens, index) {
+        const phrase = await Phrasal.find(tokens, index).catch(() => null);
+        if (phrase) return phrase;
+        const form = tokens[index].w;
+        const { key, entry } = await Dict.lemma(form);
+        return {
+            isPhrase: false,
+            key,
+            headword: entry ? entry[0] : key,
+            form,
+            lookup: key,
+            senses: entry ? entry[1] : [],
+            positions: [index]
+        };
+    }
+
     /**
      * Picks the Portuguese meaning that fits *this* sentence: the
      * dictionary alternative that actually appears in the sentence
      * translation wins ("bank" + "margem do rio" → "margem").
      */
-    async function explain(form, sentence, sentenceTranslation) {
-        const { key, entry } = await Dict.lemma(form);
+    async function explainTarget(target, sentenceTranslation) {
         const translated = fold(sentenceTranslation);
         const translatedStems = new Set(contentWords(sentenceTranslation).map(stem));
 
-        let info = await Translate.word(key);
-        if (!info && key !== normalizeWord(form)) info = await Translate.word(normalizeWord(form));
+        let info = await Translate.word(target.lookup);
+        if (!info && target.form && target.form !== target.lookup) info = await Translate.word(target.form);
 
         const options = [];
         (info?.dictionary || []).forEach(group => group.terms.forEach(term => options.push({ term, pos: group.pos })));
@@ -461,7 +575,7 @@
         const gloss = (match?.term || info?.translation || options[0]?.term || "").toLowerCase();
 
         let sense = null;
-        const senses = entry ? entry[1] : [];
+        const senses = target.senses || [];
         if (senses.length) {
             const glossStems = foldedWords(gloss, 3).map(stem);
             let best = -1;
@@ -474,16 +588,25 @@
                 if (match?.pos && pos && match.pos.toLowerCase() === String(pos).toLowerCase()) score += 2;
                 if (score > best) { best = score; sense = candidate; }
             });
+            // Without evidence, showing a definition could be the wrong sense.
+            if (best <= 0 && senses.length > 1) sense = null;
         }
 
         return {
-            key,
-            headword: entry ? entry[0] : key,
             gloss,
             pos: sense ? sense[0] : (match?.pos || ""),
             definition: sense ? sense[1] : "",
             senseId: sense ? sense[3] : ""
         };
+    }
+
+    /** Single-word meaning (used for retries of older entries). */
+    async function explain(form, sentence, sentenceTranslation) {
+        const { key, entry } = await Dict.lemma(form);
+        const meaning = await explainTarget({
+            key, form: normalizeWord(form), lookup: key, senses: entry ? entry[1] : []
+        }, sentenceTranslation);
+        return { key, headword: entry ? entry[0] : key, ...meaning };
     }
 
 
@@ -515,43 +638,63 @@
         els.lines.querySelectorAll(selector).forEach(el => el.classList.add("saved"));
     }
 
-    /** One tap: saves immediately, enriches in the background. */
-    function saveWord(form, sentence, sentenceTranslation) {
-        markSaved(form);
-        showToast(form);
-        if (navigator.vibrate) navigator.vibrate(12);
+    function refreshOpenViews(key) {
+        if (!els.detail.hidden && els.detail.dataset.key === key) openDetail(key);
+        if (!els.library.hidden) renderLibrary();
+    }
 
+    /** One tap: saves immediately (no confirmation), meaning arrives after. */
+    function saveTarget(target, sentence, translationPromise, meaningPromise) {
         saveChain = saveChain.then(async () => {
-            const { key, entry } = await Dict.lemma(form);
             const now = new Date().toISOString();
-            const record = (await Store.get(key)) || {
-                key,
-                headword: entry ? entry[0] : key,
+            const record = (await Store.get(target.key)) || {
+                key: target.key,
+                headword: target.headword,
                 createdAt: now,
                 updatedAt: now,
                 box: 0,
                 due: Date.now(),
-                contexts: []
+                contexts: [],
+                ...(target.isPhrase ? { phrase: true, lookup: target.lookup, senses: target.senses } : {})
             };
             record.updatedAt = now;
-            let context = record.contexts.find(c => c.sentence === sentence);
-            if (!context) {
-                context = {
-                    form,
+            if (!record.contexts.some(c => c.sentence === sentence)) {
+                record.contexts.push({
+                    form: target.form,
                     sentence,
-                    translation: sentenceTranslation || "",
+                    translation: "",
                     gloss: "",
                     definition: "",
                     pos: "",
                     at: now
-                };
-                record.contexts.push(context);
+                });
             }
             await Store.put(record);
-            savedForms.add(key);
+            savedForms.add(target.key);
             updateLibraryBadge((await Store.all()).length);
-            enrich(record.key);
         }).catch(error => console.error("save failed", error));
+
+        Promise.all([translationPromise, meaningPromise.catch(() => null)])
+            .then(([translation, meaning]) => {
+                saveChain = saveChain.then(async () => {
+                    const record = await Store.get(target.key);
+                    const context = record?.contexts.find(c => c.sentence === sentence);
+                    if (!context) return;
+                    if (!context.translation && translation) context.translation = translation;
+                    if (!context.gloss && !context.definition && meaning && (meaning.gloss || meaning.definition)) {
+                        Object.assign(context, {
+                            gloss: meaning.gloss,
+                            definition: meaning.definition,
+                            pos: meaning.pos,
+                            senseId: meaning.senseId
+                        });
+                    }
+                    await Store.put(record);
+                    refreshOpenViews(target.key);
+                }).catch(error => console.error("save failed", error));
+                return saveChain;
+            })
+            .finally(() => enrich(target.key));
     }
 
     const enriching = new Set();
@@ -569,7 +712,11 @@
                     if (translation) { context.translation = translation; changed = true; }
                 }
                 if (!context.gloss && !context.definition) {
-                    const meaning = await explain(context.form, context.sentence, context.translation);
+                    const meaning = record.phrase
+                        ? await explainTarget({
+                            key: record.key, form: context.form, lookup: record.lookup || record.key, senses: record.senses || []
+                        }, context.translation)
+                        : await explain(context.form, context.sentence, context.translation);
                     if (meaning.gloss || meaning.definition) {
                         Object.assign(context, {
                             gloss: meaning.gloss,
@@ -577,7 +724,7 @@
                             pos: meaning.pos,
                             senseId: meaning.senseId
                         });
-                        if (record.headword === record.key && meaning.headword) record.headword = meaning.headword;
+                        if (!record.phrase && record.headword === record.key && meaning.headword) record.headword = meaning.headword;
                         changed = true;
                     }
                 }
@@ -590,8 +737,7 @@
                     latest.headword = record.headword;
                     await Store.put(latest);
                 }
-                if (!els.detail.hidden && els.detail.dataset.key === key) openDetail(key);
-                if (!els.library.hidden) renderLibrary();
+                refreshOpenViews(key);
             }
         } catch (error) {
             console.error("enrich failed", error);
@@ -641,6 +787,7 @@
                 const span = document.createElement("span");
                 span.className = "w" + (savedForms.has(token.w) ? " saved" : "");
                 span.dataset.w = token.w;
+                span.dataset.i = String(index);
                 span.textContent = token.t;
                 fragment.append(span);
             } else {
@@ -772,10 +919,114 @@
             sentence = line.text;
             translation = line.translation;
         }
-        span.classList.add("flash");
-        setTimeout(() => span.classList.remove("flash"), 450);
-        saveWord(span.dataset.w, sentence, translation);
+        onWordTap(span, lineEl, sentence, translation);
     });
+
+    function flash(spans) {
+        spans.forEach(span => {
+            span.classList.add("flash");
+            setTimeout(() => span.classList.remove("flash"), 600);
+        });
+    }
+
+    /** Tap → balloon with the meaning in context + saved to the library. Captions keep running. */
+    async function onWordTap(span, lineEl, sentence, translation) {
+        const tokens = tokenize(sentence);
+        const index = Number(span.dataset.i);
+        if (!tokens[index] || tokens[index].w !== span.dataset.w) return;
+        if (navigator.vibrate) navigator.vibrate(12);
+        flash([span]);
+        const bubble = Bubble.show(span);
+
+        const target = await resolveTarget(tokens, index);
+        const spans = target.positions
+            .map(position => lineEl.querySelector(`.w[data-i="${position}"]`))
+            .filter(Boolean);
+        flash(spans);
+        spans.forEach(el => el.classList.add("saved"));
+        if (!target.isPhrase) markSaved(target.form);
+        Bubble.label(bubble, target.isPhrase ? target.headword : "");
+
+        const translationPromise = translation
+            ? Promise.resolve(translation)
+            : Translate.sentence(sentence).catch(() => null);
+        const meaningPromise = translationPromise.then(tr => explainTarget(target, tr));
+        meaningPromise
+            .then(meaning => Bubble.fill(bubble, meaning.gloss || meaning.definition || "salva ✓"))
+            .catch(() => Bubble.fill(bubble, "salva ✓ (sem conexão)"));
+
+        saveTarget(target, sentence, translationPromise, meaningPromise);
+    }
+
+
+    // ============================================================
+    // MEANING BALLOON (over the tapped word; never blocks the captions)
+    // ============================================================
+
+    const Bubble = (() => {
+        let current = null;
+        let timer = null;
+
+        function place(state) {
+            const { el, anchor } = state;
+            if (!anchor.isConnected) return;
+            const host = els.lines.getBoundingClientRect();
+            const view = els.captions.getBoundingClientRect();
+            const rect = anchor.getBoundingClientRect();
+            const width = el.offsetWidth;
+            const center = rect.left - host.left + rect.width / 2;
+            const left = Math.max(0, Math.min(center - width / 2, host.width - width));
+            let top = rect.top - host.top - el.offsetHeight - 10;
+            const below = rect.top - el.offsetHeight - 10 < view.top;
+            if (below) top = rect.bottom - host.top + 10;
+            el.classList.toggle("below", below);
+            el.style.left = `${left}px`;
+            el.style.top = `${top}px`;
+            el.style.setProperty("--arrow-x", `${Math.max(14, Math.min(center - left, width - 14))}px`);
+        }
+
+        function hide() {
+            clearTimeout(timer);
+            if (!current) return;
+            const old = current.el;
+            old.classList.add("out");
+            setTimeout(() => old.remove(), 200);
+            current = null;
+        }
+
+        function show(anchor) {
+            hide();
+            const el = document.createElement("div");
+            el.className = "bubble";
+            el.setAttribute("role", "status");
+            el.innerHTML = `<span class="bubble-label" hidden></span><span class="bubble-text loading">…</span>`;
+            els.lines.append(el);
+            current = { el, anchor };
+            place(current);
+            timer = setTimeout(hide, 8000);
+            return el;
+        }
+
+        function label(el, text) {
+            if (current?.el !== el) return;
+            const node = el.querySelector(".bubble-label");
+            node.textContent = text;
+            node.hidden = !text;
+            place(current);
+        }
+
+        function fill(el, text) {
+            if (current?.el !== el) return;
+            const node = el.querySelector(".bubble-text");
+            node.textContent = text;
+            node.classList.remove("loading");
+            place(current);
+            clearTimeout(timer);
+            timer = setTimeout(hide, 3800);
+        }
+
+        return { show, label, fill, hide };
+    })();
 
     function setMode(next) {
         mode = next;
@@ -978,20 +1229,8 @@
 
 
     // ============================================================
-    // TOAST + SPEECH SYNTHESIS
+    // SPEECH SYNTHESIS
     // ============================================================
-
-    let toastTimer = null;
-
-    function showToast(word) {
-        els.toast.textContent = word;
-        els.toast.hidden = false;
-        els.toast.style.animation = "none";
-        void els.toast.offsetWidth;
-        els.toast.style.animation = "";
-        clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => { els.toast.hidden = true; }, 1300);
-    }
 
     function speak(text) {
         if (!("speechSynthesis" in window)) return;
@@ -1071,7 +1310,9 @@
         els.detail.dataset.key = key;
         els.detail.querySelector("h2").textContent = "";
         const contexts = [...record.contexts].reverse();
-        const entry = await Dict.entry(record.key).catch(() => null);
+        const entry = record.phrase
+            ? (record.senses?.length ? [record.headword, record.senses] : null)
+            : await Dict.entry(record.key).catch(() => null);
 
         els.detailBody.innerHTML = `
             <div class="detail-head">
@@ -1289,6 +1530,6 @@
     }
 
     // Exposed for automated tests only.
-    window.__zwordsListen = { addFinal, setInterim, explain, Dict, Translate, Store, splitSentences, tokenize, saveWord };
+    window.__zwordsListen = { addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
 
 })();
