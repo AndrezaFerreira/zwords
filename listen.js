@@ -80,8 +80,13 @@
         return foldedWords(text, 3).filter(w => !PT_STOPWORDS.has(w));
     }
 
+    const PT_SUFFIXES = /(ando|endo|indo|ados|adas|idos|idas|ado|ada|ido|ida|ava|ia|ou|ei|ar|er|ir|os|as|es|o|a|e|s)$/;
+
+    /** Rough Portuguese stem so "achar" matches "acho", "casas" matches "casa". */
     function stem(word) {
-        return word.length > 5 ? word.slice(0, word.length - 2) : word;
+        if (word.length < 4) return word;
+        const cut = word.replace(PT_SUFFIXES, "");
+        return cut.length >= 3 ? cut : word;
     }
 
     /** Splits recognized text into sentences without losing any word. */
@@ -559,14 +564,33 @@
         return POS_PT[String(pos || "").toLowerCase()] || pos || "";
     }
 
+    const SUBJECTS = new Set(["i", "you", "we", "they", "he", "she", "it", "who", "people"]);
+    const VERB_BEFORE = new Set(["to", "can", "could", "will", "would", "should", "must", "might", "may", "shall",
+        "do", "does", "did", "don't", "doesn't", "didn't", "can't", "couldn't", "won't", "wouldn't", "shouldn't",
+        "i'll", "you'll", "we'll", "they'll", "he'll", "she'll", "i'd", "you'd", "we'd", "they'd", "let's", "just", "never", "always"]);
+    const NOUN_BEFORE = new Set(["the", "a", "an", "this", "that", "these", "those", "my", "your", "his", "her",
+        "its", "our", "their", "some", "any", "every", "each", "no", "of"]);
+
+    /** Context around the tapped word: likely part of speech and the subject before a verb. */
+    function contextHint(tokens, index) {
+        const previous = tokens[index - 1]?.w || "";
+        if (SUBJECTS.has(previous)) return { pos: "verb", lead: tokens[index - 1].w };
+        if (VERB_BEFORE.has(previous)) return { pos: "verb", lead: "" };
+        if (NOUN_BEFORE.has(previous)) return { pos: "noun", lead: "" };
+        return { pos: "", lead: "" };
+    }
+
     /** What a tap means: a phrasal verb/expression around the word, or the word itself. */
     async function resolveTarget(tokens, index) {
         const phrase = await Phrasal.find(tokens, index).catch(() => null);
         if (phrase) return phrase;
         const form = tokens[index].w;
         const { key, entry } = await Dict.lemma(form);
+        const hint = contextHint(tokens, index);
         return {
             isPhrase: false,
+            posHint: hint.pos,
+            lead: hint.lead,
             key,
             headword: entry ? entry[0] : key,
             form,
@@ -588,8 +612,11 @@
         let info = await Translate.word(target.lookup);
         if (!info && target.form && target.form !== target.lookup) info = await Translate.word(target.form);
 
+        const hinted = target.posHint || "";
+        const groups = [...(info?.dictionary || [])]
+            .sort((a, b) => (b.pos === hinted) - (a.pos === hinted));
         const options = [];
-        (info?.dictionary || []).forEach(group => group.terms.forEach(term => options.push({ term, pos: group.pos })));
+        groups.forEach(group => group.terms.forEach(term => options.push({ term, pos: group.pos })));
         if (info?.translation) options.push({ term: info.translation, pos: "" });
 
         let match = null;
@@ -600,7 +627,17 @@
             }) || null;
         }
 
-        const gloss = (match?.term || info?.translation || options[0]?.term || "").toLowerCase();
+        let gloss = match?.term || "";
+        if (!gloss && target.lead) {
+            // "I figure" → "eu acho": translating with the subject gives the verb sense.
+            const phrase = await Translate.word(`${target.lead} ${target.form}`).catch(() => null);
+            if (phrase?.translation) gloss = phrase.translation;
+        }
+        if (!gloss && hinted) {
+            gloss = groups.find(group => group.pos === hinted)?.terms[0] || "";
+        }
+        if (!gloss) gloss = info?.translation || options[0]?.term || "";
+        gloss = gloss.toLowerCase();
 
         let sense = null;
         const senses = target.senses || [];
@@ -613,7 +650,8 @@
                 let score = 0;
                 defStems.forEach(s => { if (translatedStems.has(s)) score += 1; });
                 glossStems.forEach(s => { if (defStems.some(d => d.startsWith(s) || s.startsWith(d))) score += 3; });
-                if (match?.pos && pos && match.pos.toLowerCase() === String(pos).toLowerCase()) score += 2;
+                const wanted = (match?.pos || hinted).toLowerCase();
+                if (wanted && pos && wanted === String(pos).toLowerCase()) score += 2;
                 if (score > best) { best = score; sense = candidate; }
             });
             // Without evidence, showing a definition could be the wrong sense.
@@ -622,7 +660,7 @@
 
         return {
             gloss,
-            pos: sense ? sense[0] : (match?.pos || ""),
+            pos: sense ? sense[0] : (match?.pos || hinted),
             definition: sense ? sense[1] : "",
             senseId: sense ? sense[3] : ""
         };
@@ -631,8 +669,12 @@
     /** Single-word meaning (used for retries of older entries). */
     async function explain(form, sentence, sentenceTranslation) {
         const { key, entry } = await Dict.lemma(form);
+        const tokens = tokenize(sentence);
+        const index = tokens.findIndex(t => t.w === normalizeWord(form));
+        const hint = index >= 0 ? contextHint(tokens, index) : { pos: "", lead: "" };
         const meaning = await explainTarget({
-            key, form: normalizeWord(form), lookup: key, senses: entry ? entry[1] : []
+            key, form: normalizeWord(form), lookup: key, senses: entry ? entry[1] : [],
+            posHint: hint.pos, lead: hint.lead
         }, sentenceTranslation);
         return { key, headword: entry ? entry[0] : key, ...meaning };
     }
