@@ -227,13 +227,18 @@ def main() -> None:
 
     os.makedirs(OUT, exist_ok=True)
     for old in os.listdir(OUT):
-        os.remove(os.path.join(OUT, old))
+        if old.endswith(".json"):          # keep SOURCES.md
+            os.remove(os.path.join(OUT, old))
     total = 0
     for name, content in shards.items():
         path = os.path.join(OUT, f"{name}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(content, f, ensure_ascii=False, separators=(",", ":"))
         total += os.path.getsize(path)
+    # Portuguese word frequency (rank = position), used by the page to rank
+    # translations fetched on demand (Wiktionary) the same way as FreeDict's.
+    with open(os.path.join(OUT, "pt_freq.json"), "w", encoding="utf-8") as f:
+        json.dump(sorted(ranks, key=ranks.get)[:40000], f, ensure_ascii=False, separators=(",", ":"))
     with open(os.path.join(OUT, "forms.json"), "w", encoding="utf-8") as f:
         json.dump(forms, f, ensure_ascii=False, separators=(",", ":"))
     phrasal = build_phrasal()

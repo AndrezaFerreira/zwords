@@ -17,7 +17,7 @@
     "use strict";
 
     // Shown in "Minhas palavras" and compared with the server on every load.
-    const APP_VERSION = "16";
+    const APP_VERSION = "17";
 
     const $ = id => document.getElementById(id);
 
@@ -248,7 +248,7 @@
     // ============================================================
 
     // Bump when data/listen is rebuilt: a new URL bypasses every cached copy.
-    const DICT_VERSION = "2";
+    const DICT_VERSION = "3";
 
     const Dict = (() => {
         const shards = new Map();
@@ -529,6 +529,142 @@
 
         return { senses };
     })();
+
+    /**
+     * Portuguese translations from Wiktionary's translation tables, for
+     * words the fixed dictionary does not have ("wield" → empunhar, brandir…).
+     * Fetched once per word, kept on the phone, ranked most-used first with
+     * the same Portuguese frequency list used to build the fixed dictionary.
+     */
+    const WikiTranslations = (() => {
+        const STORE_KEY = "zwl_wiktionary_pt_v1";
+        const PT_FUNCTION = new Set("de a o as os do da dos das com se em para um uma no na por ao à e ou que algo alguém".split(" "));
+        const POS_NAMES = new Set(["noun", "verb", "adjective", "adverb", "preposition", "conjunction", "pronoun",
+            "interjection", "phrase", "proper noun", "idiom", "prepositional phrase", "particle", "numeral"]);
+        let memo = {};
+        try { memo = JSON.parse(localStorage.getItem(STORE_KEY) || "{}"); } catch (error) { memo = {}; }
+        let freqPromise = null;
+        const inFlight = new Map();
+
+        function persist() {
+            try {
+                const keys = Object.keys(memo);
+                if (keys.length > 3000) keys.slice(0, keys.length - 3000).forEach(k => delete memo[k]);
+                localStorage.setItem(STORE_KEY, JSON.stringify(memo));
+            } catch (error) { /* full: ignore */ }
+        }
+
+        function frequency() {
+            if (!freqPromise) {
+                freqPromise = fetchWithTimeout(`data/listen/pt_freq.json?v=${DICT_VERSION}`, 15000)
+                    .then(r => (r.ok ? r.json() : []))
+                    .then(list => new Map(list.map((word, i) => [word, i + 1])))
+                    .catch(() => { freqPromise = null; return new Map(); });
+            }
+            return freqPromise;
+        }
+
+        function parse(wikitext) {
+            const start = wikitext.indexOf("==English==");
+            if (start < 0) return [];
+            let section = wikitext.slice(start + 11);
+            const next = section.search(/\n==[^=]/);
+            if (next >= 0) section = section.slice(0, next);
+            const out = [];
+            const seen = new Set();
+            let pos = "";
+            // Definitions labelled obsolete/archaic: their translation tables are skipped.
+            const oldSenses = [...section.matchAll(/^#\s*\{\{lb\|en\|[^}]*\b(?:obsolete|archaic|dated)\b[^}]*\}\}\s*(.*)$/gm)]
+                .map(m => m[1].replace(/\[\[(?:[^|\]]*\|)?([^\]]*)\]\]/g, "$1").replace(/\{\{[^}]*\}\}/g, "").toLowerCase());
+            let skipTable = false;
+            for (const line of section.split("\n")) {
+                const table = line.match(/^\{\{trans-top(?:-see)?\|([^|}]*)/);
+                if (table) {
+                    const gloss = table[1].toLowerCase().split(/[;,]/)[0].trim();
+                    skipTable = gloss.length > 3 && oldSenses.some(def => def.includes(gloss));
+                    continue;
+                }
+                if (/^\{\{trans-bottom/.test(line)) { skipTable = false; continue; }
+                if (skipTable) continue;
+                const heading = line.match(/^===+\s*([^=]+?)\s*===+\s*$/);
+                if (heading) {
+                    const name = heading[1].toLowerCase();
+                    if (POS_NAMES.has(name)) pos = name;
+                    continue;
+                }
+                const row = line.match(/^\*:?\s*(?:Brazilian )?Portuguese:\s*(.*)$/);
+                if (!row) continue;
+                for (const item of row[1].matchAll(/\{\{tt?\+?\|pt\|([^|}]+)/g)) {
+                    const text = item[1].replace(/\[\[|\]\]/g, "").trim();
+                    if (text && !seen.has(text)) {
+                        seen.add(text);
+                        out.push([text, pos]);
+                    }
+                }
+            }
+            return out;
+        }
+
+        async function rank(list) {
+            const ranks = await frequency();
+            const score = text => {
+                const words = text.toLowerCase().split(/[\s-]+/).filter(Boolean);
+                const content = words.filter(w => !PT_FUNCTION.has(w));
+                const used = content.length ? content : words;
+                const rarest = Math.max(...used.map(w => ranks.get(w) || 80000));
+                const generic = used.length === 1 && rarest < 1000 ? 6 : 0;    // "claro", "bem"…
+                return Math.log(rarest) + 1.5 * (used.length - 1) + generic;
+            };
+            return list
+                .map((item, i) => ({ item, i, s: score(item[0]) }))
+                .sort((a, b) => a.s - b.s || a.i - b.i)
+                .map(x => x.item);
+        }
+
+        async function fetchTitle(title) {
+            const url = "https://en.wiktionary.org/w/api.php?action=parse&prop=wikitext&format=json&formatversion=2&redirects=1&origin=*&page="
+                + encodeURIComponent(title.replace(/ /g, "_"));
+            const response = await fetchWithTimeout(url, 10000);
+            if (!response.ok) throw new Error("wiktionary " + response.status);
+            const data = await response.json();
+            return data?.parse?.wikitext || "";
+        }
+
+        function cached(term) {
+            return memo[term] || null;
+        }
+
+        /** [[translation, pos], …] most used first; [] if none; null if offline. */
+        function get(term) {
+            if (memo[term]) return Promise.resolve(memo[term]);
+            if (inFlight.has(term)) return inFlight.get(term);
+            const job = (async () => {
+                try {
+                    let list = parse(await fetchTitle(term));
+                    if (!list.length && term === term.toLowerCase()) {
+                        list = parse(await fetchTitle(term[0].toUpperCase() + term.slice(1)));
+                    }
+                    const ranked = await rank(list);
+                    memo[term] = ranked;
+                    persist();
+                    return ranked;
+                } catch (error) {
+                    return null;
+                } finally {
+                    inFlight.delete(term);
+                }
+            })();
+            inFlight.set(term, job);
+            return job;
+        }
+
+        return { get, cached, parse };
+    })();
+
+    /** Fixed dictionary first; Wiktionary's tables for words it does not have. */
+    function translationsFor(key, own) {
+        return own?.[2]?.length ? own[2] : (WikiTranslations.cached(key) || []);
+    }
 
     /** Extra senses that are not already said by ZWords' own dictionary. */
     function newSenses(base, extras) {
@@ -812,11 +948,11 @@
     /** Everything a saved word shows, computed the same way everywhere. */
     async function wordProfile(record) {
         const own = await Dict.entry(record.key).catch(() => null);
-        const translations = own?.[2] || [];
+        const translations = translationsFor(record.phrase ? (record.lookup || record.key) : record.key, own);
         const senses = record.phrase ? (record.senses || []) : (own?.[1] || []);
         const pos = record.phrase
             ? phrasePos(senses)
-            : (record.contexts.find(c => c.pos)?.pos || translations[0]?.[1] || senses[0]?.[0] || "");
+            : (translations[0]?.[1] || senses[0]?.[0] || record.contexts.find(c => c.pos)?.pos || "");
         let top = translations.slice(0, 3).map(([text]) => text);
         if (!top.length) {
             top = [...new Set([...record.contexts].reverse().map(c => cleanGloss(c.gloss)).filter(Boolean))].slice(0, 3);
@@ -886,7 +1022,7 @@
         const phrase = await Phrasal.find(tokens, index).catch(() => null);
         if (phrase) {
             const own = await Dict.entry(phrase.key).catch(() => null);
-            return { ...phrase, tokens, translations: own?.[2] || [] };
+            return { ...phrase, tokens, translations: translationsFor(phrase.lookup || phrase.key, own) };
         }
         const form = tokens[index].w;
         const { key, entry } = await Dict.lemma(form);
@@ -894,7 +1030,7 @@
         // "thriving": its own translations ("próspero") first, then those of "thrive".
         const formEntry = form !== key ? await Dict.entry(form).catch(() => null) : null;
         const seen = new Set();
-        const translations = [...(formEntry?.[2] || []), ...(entry?.[2] || [])]
+        const translations = [...(formEntry?.[2] || []), ...translationsFor(key, entry)]
             .filter(([text]) => !seen.has(text) && seen.add(text));
         return {
             isPhrase: false,
@@ -934,7 +1070,7 @@
         return {
             contextual: contextual ? contextual[0] : "",
             top: ordered.slice(0, 3).map(([text]) => text),
-            pos: contextual ? contextual[1] : hinted
+            pos: contextual ? contextual[1] : (ordered[0]?.[1] || "")
         };
     }
 
@@ -945,6 +1081,9 @@
      * word ("Ela [desistiu] de fumar").
      */
     async function explainTarget(target, sentenceTranslation, { network = true } = {}) {
+        if (network && !target.translations?.length) {
+            target.translations = (await WikiTranslations.get(target.lookup || target.key)) || [];
+        }
         let contextual = "";
         if (network && target.tokens && target.positions?.length) {
             const first = target.positions[0];
@@ -1563,8 +1702,17 @@
         // Instant and offline: the 3 most used translations.
         const pick = pickTranslations(target, translation || Translate.cached(sentence));
         Bubble.label(bubble, headerLabel(target.headword, targetPos(target, pick)));
-        if (pick.top.length) Bubble.fillWords(bubble, pick.top, Boolean(pick.contextual));
-        else showDictionaryFallback(bubble, target);
+        if (pick.top.length) {
+            Bubble.fillWords(bubble, pick.top, Boolean(pick.contextual));
+        } else {
+            showDictionaryFallback(bubble, target);
+            WikiTranslations.get(target.lookup || target.key).then(list => {
+                if (!list?.length) return;
+                target.translations = list;
+                const later = pickTranslations(target, translation || Translate.cached(sentence));
+                Bubble.fillWords(bubble, later.top, Boolean(later.contextual));
+            });
+        }
 
         // In the background (once): the exact word used in this sentence.
         const translationPromise = translation
@@ -1896,6 +2044,7 @@
 
         els.libraryEmpty.hidden = all.length > 0;
         const profiles = new Map(await Promise.all(filtered.map(async r => [r.key, await wordProfile(r)])));
+        completeMissingTranslations(filtered, profiles);
         els.wordList.innerHTML = filtered.map(record => {
             const profile = profiles.get(record.key);
             return `
@@ -1910,6 +2059,28 @@
             </li>`;
         }).join("")
             || (all.length ? `<li class="library-empty">Nada encontrado para “${escapeHtml(els.librarySearch.value)}”.</li>` : "");
+    }
+
+    let completing = false;
+
+    /** Words without short translations get them from Wiktionary, one at a time. */
+    async function completeMissingTranslations(records, profiles) {
+        if (completing || !navigator.onLine) return;
+        const missing = records.filter(r => !profiles.get(r.key)?.translations.length);
+        if (!missing.length) return;
+        completing = true;
+        let found = false;
+        try {
+            for (const record of missing) {
+                const list = await WikiTranslations.get(record.phrase ? (record.lookup || record.key) : record.key);
+                if (list?.length) found = true;
+                await sleep(400);
+            }
+        } finally {
+            completing = false;
+        }
+        if (found && !els.library.hidden) renderLibrary();
+        if (found && !els.detail.hidden) openDetail(els.detail.dataset.key);
     }
 
     function openSheet(sheet) {
@@ -1955,6 +2126,7 @@
         // Every translation from the fixed dictionary, grouped by part of speech.
         const profile = await wordProfile(record);
         const translations = profile.translations;
+        if (!translations.length) completeMissingTranslations([record], new Map([[record.key, profile]]));
         const groups = [];
         translations.forEach(([text, pos], i) => {
             let group = groups.find(g => g.pos === pos);
@@ -1997,7 +2169,7 @@
                     ${allSenses.map(([pos, definition, source]) => `<li>${escapeHtml(cleanDefinition(definition))} <em>${escapeHtml(posLabel(pos))}${source === "wiktionary" ? " · Wiktionary" : ""}</em></li>`).join("")}
                 </ol>
                 ${extraSenses.length ? `<p class="source-note">Sentidos marcados com Wiktionary: dicionário aberto (CC BY-SA), traduzidos automaticamente.</p>` : ""}
-                ${groups.length ? `<p class="source-note">Traduções: FreeDict (GPL), ordenadas pelas mais usadas no português.</p>` : ""}`
+                ${groups.length ? `<p class="source-note">Traduções: FreeDict (GPL) e Wiktionary (CC BY-SA), ordenadas pelas mais usadas no português.</p>` : ""}`
                 : (record.extra ? "" : `<p class="source-note">Buscando todos os sentidos…</p>`)}
         `;
         openSheet(els.detail);
@@ -2231,6 +2403,6 @@
     ensureLatestVersion();
 
     // Exposed for automated tests only.
-    window.__zwordsListen = { Wiki, ensureExtras, newSenses, markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
+    window.__zwordsListen = { WikiTranslations, Wiki, ensureExtras, newSenses, markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
 
 })();
