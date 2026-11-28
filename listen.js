@@ -553,6 +553,7 @@
         const cache = new Map();
         let onDevice = null;
         let googleBlockedUntil = 0;
+        let memoryBlockedUntil = Number(localStorage.getItem("zwl_mymemory_blocked") || 0);
         let active = 0;
         const waiting = [];
 
@@ -626,11 +627,18 @@
         }
 
         async function myMemory(text) {
+            if (Date.now() < memoryBlockedUntil) throw new Error("mymemory paused");
             const url = "https://api.mymemory.translated.net/get?langpair=en|pt-BR&q=" + encodeURIComponent(text.slice(0, 480));
             const response = await fetchWithTimeout(url);
             const data = await response.json();
             const result = data?.responseData?.translatedText;
-            if (data?.responseStatus !== 200 || !result || /MYMEMORY WARNING/i.test(result)) throw new Error("mymemory");
+            if (data?.quotaFinished || /MYMEMORY WARNING|USED ALL AVAILABLE FREE/i.test(result || "") || data?.responseStatus === 429) {
+                // Daily free quota used up: leave it alone for a few hours.
+                memoryBlockedUntil = Date.now() + 6 * 60 * 60 * 1000;
+                try { localStorage.setItem("zwl_mymemory_blocked", String(memoryBlockedUntil)); } catch (e) { /* ignore */ }
+                throw new Error("mymemory quota");
+            }
+            if (data?.responseStatus !== 200 || !result) throw new Error("mymemory");
             return result.trim();
         }
 
@@ -714,19 +722,15 @@
             } catch (error) {
                 result = null;
             }
-            if (!result) {
-                result = [];
-                for (const text of texts) {
-                    const translated = await sentence(text);
-                    if (!translated) return null;
-                    result.push(translated);
-                }
-            }
+            if (!result) return null;                 // try again later, when Google answers
             remember(key, result);
             return result;
         }
 
-        return { prepareOnDevice, sentence, word, cached, marked, lines };
+        /** Background work only runs when Google answers; the backup is kept for taps. */
+        const googleAvailable = () => Date.now() >= googleBlockedUntil;
+
+        return { prepareOnDevice, sentence, word, cached, marked, lines, googleAvailable };
     })();
 
 
@@ -1113,7 +1117,10 @@
         if (!navigator.onLine) return;
         const all = await Store.all();
         for (const record of all) {
-            if (record.extra?.v !== EXTRA_VERSION) await ensureExtras(record.key);
+            if (record.extra?.v === EXTRA_VERSION) continue;
+            if (!Translate.googleAvailable()) return;          // retried later (scheduleRetry)
+            await ensureExtras(record.key);
+            await sleep(1500);
         }
     }
 
@@ -1129,6 +1136,8 @@
             for (const record of all) {
                 for (const context of record.contexts) {
                     if ((context.mv || 1) >= MEANING_VERSION && context.gloss) continue;
+                    if (!Translate.googleAvailable()) break;         // don't burn the backup's quota
+                    await sleep(700);
                     const done = saveChain.then(() => refreshContext(record.key, context.sentence));
                     saveChain = done.catch(() => {});
                     if (await done.catch(() => false)) changed = true;
@@ -1157,7 +1166,7 @@
         clearTimeout(retryTimer);
         const pending = await pendingCount();
         updatePendingNote(pending);
-        if (pending) retryTimer = setTimeout(() => refreshOutdated(), 3 * 60 * 1000);
+        if (pending) retryTimer = setTimeout(() => refreshOutdated().then(ensureAllExtras), 3 * 60 * 1000);
     }
 
     function updatePendingNote(pending) {
@@ -1427,6 +1436,14 @@
         });
     }
 
+    /** No translator answered: show ZWords' own (offline) definition meanwhile. */
+    function showDictionaryFallback(bubble, target) {
+        const senses = target.senses || [];
+        const sense = senses.find(([pos]) => target.posHint && String(pos).toLowerCase() === target.posHint) || senses[0];
+        Bubble.label(bubble, `${target.isPhrase ? target.headword + " · " : ""}dicionário · contexto pendente`);
+        Bubble.fill(bubble, sense ? sense[1] : "salva ✓ · tradução pendente");
+    }
+
     /** Tap → balloon with the meaning in context + saved to the library. Captions keep running. */
     async function onWordTap(span, lineEl, fullSentence, fullTranslation) {
         const tapped = Number(span.dataset.i);
@@ -1461,8 +1478,14 @@
             : Translate.sentence(sentence).catch(() => null);
         const meaningPromise = translationPromise.then(tr => explainTarget(target, tr));
         meaningPromise
-            .then(meaning => Bubble.fill(bubble, meaning.gloss || meaning.definition || "salva ✓"))
-            .catch(() => Bubble.fill(bubble, "salva ✓ (sem conexão)"));
+            .then(meaning => {
+                if (meaning.gloss || meaning.definition) {
+                    Bubble.fill(bubble, meaning.gloss || meaning.definition);
+                } else {
+                    showDictionaryFallback(bubble, target);
+                }
+            })
+            .catch(() => showDictionaryFallback(bubble, target));
 
         saveTarget(target, sentence, translationPromise, meaningPromise);
     }
