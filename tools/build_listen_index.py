@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Builds the compact, sharded dictionary used by the "Ouvir" (listen) page.
 
-Input : data/word_lookup_index.json, data/04_cards_irregular_verbs.json
-Output: data/listen/<shard>.json  ->  { key: [displayWord, [[pos, definition_pt, deck, sense_id], ...]] }
+Input : data/word_lookup_index.json, data/04_cards_irregular_verbs.json, the
+        decks, plus two open sources downloaded by this script:
+        - FreeDict English-Portuguese (GPL-2.0+): short translations
+        - FrequencyWords pt_br_50k (MIT): used to put the most common
+          translations first
+Output: data/listen/<shard>.json  ->  { key: [displayWord, [[pos, definition_pt, deck, sense_id], ...],
+                                              [[translation, pos], ...]  (most used first)] }
         data/listen/forms.json    ->  { irregular_form: base_form }
         data/listen/phrasal.json  ->  { first_word: [[display, pattern, senses], ...] }
           pattern items: "word" | "a/b" (alternatives) | "~" (object slot) | "@" (possessive) | "#" (reflexive)
@@ -11,9 +16,12 @@ Shards are keyed by the first two letters so the phone only downloads the
 few small files it actually needs (cached offline by the service worker).
 """
 import json
+import math
 import os
 import re
 import sys
+import urllib.request
+import xml.etree.ElementTree as ET
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "data")
@@ -107,6 +115,78 @@ def build_phrasal() -> dict:
     return index
 
 
+FREEDICT_URL = "https://raw.githubusercontent.com/freedict/fd-dictionaries/master/eng-por/eng-por.tei"
+FREQ_URL = "https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/pt_br/pt_br_50k.txt"
+CACHE = os.path.join(ROOT, "tools", ".cache")
+FREEDICT_POS = {"s": "noun", "n": "noun", "v": "verb", "vt": "verb", "vi": "verb", "adj": "adjective",
+                "a": "adjective", "adv": "adverb", "prep": "preposition", "conj": "conjunction",
+                "pron": "pronoun", "interj": "interjection", "art": "article", "num": "numeral"}
+PT_FUNCTION = {"de", "a", "o", "as", "os", "do", "da", "dos", "das", "com", "se", "em", "para", "um", "uma",
+               "no", "na", "por", "ao", "à", "e", "ou", "que", "algo", "alguém"}
+PARTICLES = {"up", "down", "out", "off", "in", "on", "back", "away", "over", "around", "round", "about",
+             "through", "along", "together", "apart", "aside", "forward", "across", "by", "for", "with",
+             "into", "onto", "after", "at", "to", "from", "of", "upon", "behind", "ahead"}
+
+
+def download(url: str, name: str) -> str:
+    os.makedirs(CACHE, exist_ok=True)
+    path = os.path.join(CACHE, name)
+    if not os.path.exists(path):
+        with urllib.request.urlopen(url, timeout=120) as response, open(path, "wb") as out:
+            out.write(response.read())
+    return path
+
+
+def load_frequency() -> dict:
+    ranks = {}
+    with open(download(FREQ_URL, "pt_br_50k.txt"), encoding="utf-8") as f:
+        for rank, line in enumerate(f, 1):
+            word = line.split(" ")[0].strip().lower()
+            if word and word not in ranks:
+                ranks[word] = rank
+    return ranks
+
+
+def translation_score(text: str, ranks: dict) -> float:
+    words = [w for w in re.split(r"[\s\-]+", text.lower()) if w]
+    content = [w for w in words if w not in PT_FUNCTION] or words
+    rarest = max(ranks.get(w, 80000) for w in content)
+    return math.log(rarest) + 1.5 * (len(content) - 1)
+
+
+def load_freedict(ranks: dict) -> dict:
+    """{ key: (orth, [[translation, pos], ...]) } with the most used translations first."""
+    ns = {"tei": "http://www.tei-c.org/ns/1.0"}
+    root = ET.parse(download(FREEDICT_URL, "eng-por.tei")).getroot()
+    out: dict[str, tuple] = {}
+    for entry in root.iter("{http://www.tei-c.org/ns/1.0}entry"):
+        orth = entry.find("tei:form/tei:orth", ns)
+        if orth is None or not (orth.text or "").strip():
+            continue
+        word = orth.text.strip()
+        pos = ""
+        items = []
+        for child in entry:
+            tag = child.tag.split("}")[1]
+            if tag == "gramGrp":
+                code = (child.findtext("tei:pos", default="", namespaces=ns) or "").strip().lower()
+                pos = FREEDICT_POS.get(code, "")
+            elif tag == "sense":
+                for quote in child.iter("{http://www.tei-c.org/ns/1.0}quote"):
+                    text = (quote.text or "").strip()
+                    if text:
+                        items.append((text, pos))
+        key = word.lower()
+        previous = out.get(key, (word, []))[1]
+        seen = {t for t, _ in previous}
+        merged = previous + [[t, p] for t, p in items if t not in seen and not seen.add(t)]
+        out[key] = (word, merged)
+    for key, (word, items) in out.items():
+        order = {t: i for i, (t, _) in enumerate(items)}
+        items.sort(key=lambda item: (translation_score(item[0], ranks), order[item[0]]))
+    return out
+
+
 def main() -> None:
     with open(os.path.join(DATA, "word_lookup_index.json"), encoding="utf-8") as f:
         index = json.load(f)
@@ -122,7 +202,18 @@ def main() -> None:
         if not senses:
             continue
         k = key.lower()
-        shards.setdefault(shard_of(k), {})[k] = [entry.get("word") or key, senses]
+        shards.setdefault(shard_of(k), {})[k] = [entry.get("word") or key, senses, []]
+
+    ranks = load_frequency()
+    freedict = load_freedict(ranks)
+    for key, (word, items) in freedict.items():
+        if not items:
+            continue
+        shard = shards.setdefault(shard_of(key), {})
+        if key in shard:
+            shard[key][2] = items
+        else:
+            shard[key] = [word, [], items]
 
     forms = {}
     with open(os.path.join(DATA, "04_cards_irregular_verbs.json"), encoding="utf-8") as f:
@@ -146,6 +237,13 @@ def main() -> None:
     with open(os.path.join(OUT, "forms.json"), "w", encoding="utf-8") as f:
         json.dump(forms, f, ensure_ascii=False, separators=(",", ":"))
     phrasal = build_phrasal()
+    # FreeDict's own multi-word verbs ("look for") become recognizable expressions too.
+    known = {" ".join(item[1]) for group in phrasal.values() for item in group}
+    for key, (word, items) in freedict.items():
+        parts = key.split()
+        if 2 <= len(parts) <= 4 and items and all(p in PARTICLES for p in parts[1:]) \
+                and re.fullmatch(r"[a-z]+", parts[0]) and key not in known:
+            phrasal.setdefault(parts[0], []).append([word, parts, []])
     with open(os.path.join(OUT, "phrasal.json"), "w", encoding="utf-8") as f:
         json.dump(phrasal, f, ensure_ascii=False, separators=(",", ":"))
     print(f"{sum(len(v) for v in phrasal.values())} phrasal patterns, "

@@ -323,13 +323,16 @@
             const irregular = (await forms())[w];
             const list = candidates(w);
             if (irregular) list.splice(1, 0, irregular);
+            // First choice: a form with ZWords senses (the real dictionary form);
+            // translation-only entries like "thriving" must not split "thrive".
+            let fallback = null;
             for (const candidate of list) {
                 const found = await entry(candidate);
-                if (found && (candidate === w || candidate === irregular || candidate.length >= 3)) {
-                    return { key: candidate, entry: found };
-                }
+                if (!found || !(candidate === w || candidate === irregular || candidate.length >= 3)) continue;
+                if (found[1].length) return { key: candidate, entry: found };
+                fallback = fallback || { key: candidate, entry: found };
             }
-            return { key: w, entry: null };
+            return fallback || { key: w, entry: null };
         }
 
         return { lemma, entry };
@@ -612,7 +615,13 @@
             const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=pt&dt=t"
                 + (withDictionary ? "&dt=bd" : "")
                 + "&q=" + encodeURIComponent(text);
-            const response = await fetchWithTimeout(url);
+            let response;
+            try {
+                response = await fetchWithTimeout(url);
+            } catch (error) {
+                googleBlockedUntil = Date.now() + 60 * 1000;        // no connection: pause a minute
+                throw error;
+            }
             if (!response.ok) {
                 if (response.status === 429 || response.status >= 500) googleBlockedUntil = Date.now() + 5 * 60 * 1000;
                 throw new Error(`google ${response.status}`);
@@ -806,10 +815,18 @@
     /** What a tap means: a phrasal verb/expression around the word, or the word itself. */
     async function resolveTarget(tokens, index) {
         const phrase = await Phrasal.find(tokens, index).catch(() => null);
-        if (phrase) return { ...phrase, tokens };
+        if (phrase) {
+            const own = await Dict.entry(phrase.key).catch(() => null);
+            return { ...phrase, tokens, translations: own?.[2] || [] };
+        }
         const form = tokens[index].w;
         const { key, entry } = await Dict.lemma(form);
         const hint = contextHint(tokens, index);
+        // "thriving": its own translations ("próspero") first, then those of "thrive".
+        const formEntry = form !== key ? await Dict.entry(form).catch(() => null) : null;
+        const seen = new Set();
+        const translations = [...(formEntry?.[2] || []), ...(entry?.[2] || [])]
+            .filter(([text]) => !seen.has(text) && seen.add(text));
         return {
             isPhrase: false,
             posHint: hint.pos,
@@ -819,30 +836,53 @@
             form,
             lookup: key,
             senses: entry ? entry[1] : [],
+            translations,
             positions: [index],
             tokens
         };
     }
 
     /**
-     * Picks the Portuguese meaning that fits *this* sentence: the
-     * dictionary alternative that actually appears in the sentence
-     * translation wins ("bank" + "margem do rio" → "margem").
+     * The fixed dictionary's translations, most used first; the one that
+     * appears in the sentence translation (if known) goes first, then those
+     * of the likely part of speech.
      */
-    async function explainTarget(target, sentenceTranslation) {
+    function pickTranslations(target, sentenceTranslation) {
+        const list = target.translations || [];
+        const translated = fold(sentenceTranslation);
+        const hinted = target.posHint || "";
+        const fits = ([text]) => {
+            const words = foldedWords(text, 3);
+            return Boolean(translated) && words.length > 0 && words.every(w => translated.includes(stem(w)));
+        };
+        const contextual = list.find(fits) || null;
+        const rest = list.filter(item => item !== contextual);
+        const ordered = [
+            ...(contextual ? [contextual] : []),
+            ...(hinted ? rest.filter(([, pos]) => pos === hinted) : []),
+            ...(hinted ? rest.filter(([, pos]) => pos !== hinted) : rest)
+        ];
+        return {
+            contextual: contextual ? contextual[0] : "",
+            top: ordered.slice(0, 3).map(([text]) => text),
+            pos: contextual ? contextual[1] : hinted
+        };
+    }
+
+    /**
+     * Meaning of the tap in this sentence. The fixed dictionary always
+     * answers (offline); with `network`, one extra request translates the
+     * sentence with the expression in [brackets] for the exact contextual
+     * word ("Ela [desistiu] de fumar").
+     */
+    async function explainTarget(target, sentenceTranslation, { network = true } = {}) {
         let contextual = "";
-        if (target.tokens && target.positions?.length) {
+        if (network && target.tokens && target.positions?.length) {
             const first = target.positions[0];
             const last = target.positions[target.positions.length - 1];
             const markedTranslation = await Translate.marked(markSentence(target.tokens, first, last)).catch(() => null);
             contextual = usefulMarked(extractMarked(markedTranslation), target.tokens.slice(first, last + 1));
         }
-        const translated = fold(sentenceTranslation);
-        const translatedStems = new Set(contentWords(sentenceTranslation).map(stem));
-
-        let info = await Translate.word(target.lookup);
-        if (!info && target.form && target.form !== target.lookup) info = await Translate.word(target.form);
-
         const english = new Set([
             ...String(target.form || "").split(" "), ...String(target.lookup || "").split(" "), target.key
         ].filter(Boolean).map(w => fold(w)));
@@ -850,44 +890,19 @@
             const words = foldedWords(text, 1);
             return !words.length || words.every(w => english.has(w));
         };
-        const hinted = target.posHint || "";
-        const groups = [...(info?.dictionary || [])]
-            .sort((a, b) => (b.pos === hinted) - (a.pos === hinted));
-        const options = [];
-        groups.forEach(group => group.terms.forEach(term => options.push({ term, pos: group.pos })));
-        if (info?.translation) options.push({ term: info.translation, pos: "" });
-        for (let i = options.length - 1; i >= 0; i--) if (untranslated(options[i].term)) options.splice(i, 1);
 
-        let match = null;
-        if (translated) {
-            match = options.find(({ term }) => {
-                const words = foldedWords(term, 3);
-                return words.length > 0 && words.every(w => translated.includes(stem(w)));
-            }) || null;
-        }
-
-        let gloss = contextual || match?.term || "";
-        if (!gloss && target.lead) {
-            // "I figure" → "eu acho": translating with the subject gives the verb sense.
-            const phrase = await Translate.word(`${target.lead} ${target.form}`).catch(() => null);
-            if (phrase?.translation) gloss = phrase.translation;
-        }
-        if (!gloss && hinted) {
-            gloss = groups.find(group => group.pos === hinted)?.terms[0] || "";
-        }
-        if (!gloss) gloss = options.find(o => o.term === info?.translation)?.term || options[0]?.term || "";
-        // Never keep the English word itself as its "translation": leave it
-        // empty so the word is retried when the translator answers again.
+        const pick = pickTranslations(target, sentenceTranslation);
+        let gloss = contextual || pick.contextual || pick.top[0] || "";
         if (untranslated(gloss)) gloss = "";
         gloss = gloss.toLowerCase();
 
-        const sense = chooseSense(target.senses || [], gloss, sentenceTranslation, match?.pos || hinted);
-
+        const sense = chooseSense(target.senses || [], gloss, sentenceTranslation, pick.pos || target.posHint);
         return {
             gloss,
-            pos: sense ? sense[0] : (match?.pos || hinted),
+            pos: sense ? sense[0] : (pick.pos || target.posHint || ""),
             definition: sense ? sense[1] : "",
-            senseId: sense ? sense[3] : ""
+            senseId: sense ? sense[3] : "",
+            viaNetwork: Boolean(contextual)
         };
     }
 
@@ -926,8 +941,8 @@
         const hint = index >= 0 ? contextHint(tokens, index) : { pos: "", lead: "" };
         const meaning = await explainTarget({
             key, form: normalizeWord(form), lookup: key, senses: entry ? entry[1] : [],
-            posHint: hint.pos, lead: hint.lead
-        }, sentenceTranslation);
+            translations: entry?.[2] || [], posHint: hint.pos, lead: hint.lead
+        }, sentenceTranslation, { network: false });
         return { key, headword: entry ? entry[0] : key, ...meaning };
     }
 
@@ -1020,6 +1035,7 @@
                             definition: meaning.definition,
                             pos: meaning.pos,
                             senseId: meaning.senseId,
+                            net: Boolean(meaning.viaNetwork),
                             mv: meaning.gloss ? MEANING_VERSION : 0
                         });
                     }
@@ -1028,9 +1044,7 @@
                 }).catch(error => console.error("save failed", error));
                 return saveChain;
             })
-            .finally(() => enrich(target.key)
-                .then(refreshOutdated)                     // retries a meaning that failed
-                .then(() => ensureExtras(target.key)));
+            .finally(() => enrich(target.key).then(refreshOutdated));
     }
 
     const enriching = new Set();
@@ -1135,10 +1149,13 @@
             const all = await Store.all();
             for (const record of all) {
                 for (const context of record.contexts) {
-                    if ((context.mv || 1) >= MEANING_VERSION && context.gloss) continue;
-                    if (!Translate.googleAvailable()) break;         // don't burn the backup's quota
-                    await sleep(700);
-                    const done = saveChain.then(() => refreshContext(record.key, context.sentence));
+                    const network = Translate.googleAvailable();
+                    const outdated = (context.mv || 1) < MEANING_VERSION || !context.gloss;
+                    const improvable = context.net === false && network && (context.tries || 0) < 2;
+                    if (!outdated && !improvable) continue;
+                    if (!network && context.gloss) continue;          // keep it; improve when Google answers
+                    if (network) await sleep(700);
+                    const done = saveChain.then(() => refreshContext(record.key, context.sentence, network));
                     saveChain = done.catch(() => {});
                     if (await done.catch(() => false)) changed = true;
                 }
@@ -1158,7 +1175,7 @@
 
     async function pendingCount() {
         const all = await Store.all();
-        return all.reduce((sum, r) => sum + r.contexts.filter(c => (c.mv || 1) < MEANING_VERSION || !c.gloss).length, 0);
+        return all.reduce((sum, r) => sum + r.contexts.filter(c => !c.gloss).length, 0);
     }
 
     /** While anything is still waiting for a translation, try again every 3 minutes. */
@@ -1166,7 +1183,7 @@
         clearTimeout(retryTimer);
         const pending = await pendingCount();
         updatePendingNote(pending);
-        if (pending) retryTimer = setTimeout(() => refreshOutdated().then(ensureAllExtras), 3 * 60 * 1000);
+        if (pending) retryTimer = setTimeout(() => refreshOutdated(), 3 * 60 * 1000);
     }
 
     function updatePendingNote(pending) {
@@ -1178,7 +1195,7 @@
             : "";
     }
 
-    async function refreshContext(key, sentence) {
+    async function refreshContext(key, sentence, network = true) {
         const record = await Store.get(key);
         const context = record?.contexts.find(c => c.sentence === sentence);
         if (!context) return false;
@@ -1202,10 +1219,10 @@
         const target = await resolveTarget(tokens, index);
         if (!target.isPhrase && focus.sentence !== original) Object.assign(target, hintFields(fullTokens, fullIndex));
         const translation = shortened
-            ? await Translate.sentence(focus.sentence)
-            : (context.translation || await Translate.sentence(sentence));
+            ? (network ? await Translate.sentence(focus.sentence) : "")
+            : (context.translation || (network ? await Translate.sentence(sentence) : ""));
         if (shortened && !translation) return false;                 // offline: try again later
-        const meaning = await explainTarget(target, translation);
+        const meaning = await explainTarget(target, translation, { network });
         if (!meaning.gloss) {
             // Translator unavailable: try again later, but stop showing a wrong
             // "meaning" that is only the English word itself.
@@ -1229,6 +1246,8 @@
             pos: meaning.pos,
             senseId: meaning.senseId,
             tap: index,
+            net: Boolean(meaning.viaNetwork),
+            tries: (context.tries || 0) + (network ? 1 : 0),
             ...(focus.sentence !== original ? { full: original, fullTap: fullIndex } : {}),
             mv: MEANING_VERSION
         };
@@ -1440,8 +1459,8 @@
     function showDictionaryFallback(bubble, target) {
         const senses = target.senses || [];
         const sense = senses.find(([pos]) => target.posHint && String(pos).toLowerCase() === target.posHint) || senses[0];
-        Bubble.label(bubble, `${target.isPhrase ? target.headword + " · " : ""}dicionário · contexto pendente`);
-        Bubble.fill(bubble, sense ? sense[1] : "salva ✓ · tradução pendente");
+        Bubble.label(bubble, target.isPhrase ? target.headword : "");
+        Bubble.fill(bubble, sense ? sense[1] : "salva ✓");
     }
 
     /** Tap → balloon with the meaning in context + saved to the library. Captions keep running. */
@@ -1471,21 +1490,23 @@
         flash(spans);
         spans.forEach(el => el.classList.add("saved"));
         if (!target.isPhrase) markSaved(target.form);
-        Bubble.label(bubble, target.isPhrase ? target.headword : "");
 
+        // Instant and offline: the 3 most used translations.
+        const pick = pickTranslations(target, translation || Translate.cached(sentence));
+        Bubble.label(bubble, target.isPhrase ? target.headword : "");
+        if (pick.top.length) Bubble.fillWords(bubble, pick.top, Boolean(pick.contextual));
+        else showDictionaryFallback(bubble, target);
+
+        // In the background (once): the exact word used in this sentence.
         const translationPromise = translation
             ? Promise.resolve(translation)
             : Translate.sentence(sentence).catch(() => null);
         const meaningPromise = translationPromise.then(tr => explainTarget(target, tr));
-        meaningPromise
-            .then(meaning => {
-                if (meaning.gloss || meaning.definition) {
-                    Bubble.fill(bubble, meaning.gloss || meaning.definition);
-                } else {
-                    showDictionaryFallback(bubble, target);
-                }
-            })
-            .catch(() => showDictionaryFallback(bubble, target));
+        meaningPromise.then(meaning => {
+            if (!meaning.viaNetwork || !meaning.gloss) return;
+            const others = pick.top.filter(t => fold(t) !== fold(meaning.gloss)).slice(0, 2);
+            Bubble.fillWords(bubble, [meaning.gloss, ...others], true);
+        }).catch(() => {});
 
         saveTarget(target, sentence, translationPromise, meaningPromise);
     }
@@ -1557,7 +1578,21 @@
             timer = setTimeout(hide, 3800);
         }
 
-        return { show, label, fill, hide };
+        /** "prosperar · dar lucro · crescer" (the first in bold when it fits the sentence). */
+        function fillWords(el, words, firstFits) {
+            if (current?.el !== el) return;
+            const node = el.querySelector(".bubble-text");
+            node.innerHTML = words.map((word, i) => (i === 0 && firstFits
+                ? `<strong>${escapeHtml(word)}</strong>`
+                : escapeHtml(word))).join(" · ");
+            node.classList.remove("loading");
+            node.classList.add("words");
+            place(current);
+            clearTimeout(timer);
+            timer = setTimeout(hide, 4000);
+        }
+
+        return { show, label, fill, fillWords, hide };
     })();
 
     function setMode(next) {
@@ -1823,7 +1858,7 @@
         await renderLibrary();
         openSheet(els.library);
         pendingCount().then(updatePendingNote);
-        enrichPending().then(refreshOutdated).then(ensureAllExtras);
+        enrichPending().then(refreshOutdated);
     });
 
     $("closeLibrary").addEventListener("click", () => closeSheet(els.library));
@@ -1851,11 +1886,26 @@
         const allSenses = [...(entry ? entry[1] : []), ...extraSenses];
         if (!record.extra) ensureExtras(record.key);
 
+        // Every translation from the fixed dictionary, grouped by part of speech.
+        const own = record.phrase ? await Dict.entry(record.key).catch(() => null) : entry;
+        const translations = own?.[2] || [];
+        const groups = [];
+        translations.forEach(([text, pos], i) => {
+            let group = groups.find(g => g.pos === pos);
+            if (!group) groups.push(group = { pos, items: [] });
+            group.items.push(i < 3 ? `<strong>${escapeHtml(text)}</strong>` : escapeHtml(text));
+        });
+
         els.detailBody.innerHTML = `
             <div class="detail-head">
                 <h3>${escapeHtml(record.headword)}</h3>
                 <button type="button" class="speak" data-speak="${escapeHtml(record.headword)}" aria-label="Ouvir pronúncia">🔊</button>
             </div>
+
+            ${groups.length ? `
+                <div class="translations">
+                    ${groups.map(g => `<p>${g.pos ? `<em>${escapeHtml(posLabel(g.pos))}</em> ` : ""}${g.items.join(", ")}</p>`).join("")}
+                </div>` : ""}
 
             <p class="section-label">${contexts.length === 1 ? "Onde você encontrou" : `${contexts.length} contextos reais`}</p>
             ${contexts.map(c => `
@@ -1877,7 +1927,8 @@
                 <ol class="senses">
                     ${allSenses.map(([pos, definition, source]) => `<li>${escapeHtml(definition)} <em>${escapeHtml(posLabel(pos))}${source === "wiktionary" ? " · Wiktionary" : ""}</em></li>`).join("")}
                 </ol>
-                ${extraSenses.length ? `<p class="source-note">Sentidos marcados com Wiktionary: dicionário aberto (CC BY-SA), traduzidos automaticamente.</p>` : ""}`
+                ${extraSenses.length ? `<p class="source-note">Sentidos marcados com Wiktionary: dicionário aberto (CC BY-SA), traduzidos automaticamente.</p>` : ""}
+                ${groups.length ? `<p class="source-note">Traduções: FreeDict (GPL), ordenadas pelas mais usadas no português.</p>` : ""}`
                 : (record.extra ? "" : `<p class="source-note">Buscando todos os sentidos…</p>`)}
         `;
         openSheet(els.detail);
@@ -2063,8 +2114,8 @@
 
     setMode(mode);
     checkSupport();
-    loadSavedForms().then(enrichPending).then(refreshOutdated).then(ensureAllExtras);
-    window.addEventListener("online", () => enrichPending().then(refreshOutdated).then(ensureAllExtras));
+    loadSavedForms().then(enrichPending).then(refreshOutdated);
+    window.addEventListener("online", () => enrichPending().then(refreshOutdated));
 
     if ("serviceWorker" in navigator) {
         navigator.serviceWorker.register("./service-worker.js?v=20260913-3").catch(() => {});
