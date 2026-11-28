@@ -549,7 +549,7 @@
     // ============================================================
 
     const Translate = (() => {
-        const CACHE_KEY = "zwl_translation_cache_v1";
+        const CACHE_KEY = "zwl_translation_cache_v2";
         const cache = new Map();
         let onDevice = null;
         let googleBlockedUntil = 0;
@@ -571,6 +571,9 @@
                 } catch (error) { /* quota: ignore */ }
             }, 1500);
         }
+
+        const same = (a, b) => String(a || "").trim().toLowerCase().replace(/[.!?]+$/, "")
+            === String(b || "").trim().toLowerCase().replace(/[.!?]+$/, "");
 
         function remember(key, value) {
             cache.delete(key);
@@ -647,6 +650,7 @@
                 if (!result) {
                     try { result = await myMemory(key); } catch (error) { result = null; }
                 }
+                if (result && same(result, key)) result = null;       // left in English: not a translation
                 if (result) remember("s:" + key, result);
                 return result;
             });
@@ -668,8 +672,9 @@
                     if (!translation) {
                         try { translation = await myMemory(text); } catch (e) { translation = null; }
                     }
-                    if (translation) result = { translation, dictionary: [] };
+                    if (translation && !same(translation, text)) result = { translation, dictionary: [] };
                 }
+                if (result && same(result.translation, text) && !result.dictionary.length) result = null;
                 if (result) remember(key, result);
                 return result;
             });
@@ -833,12 +838,20 @@
         let info = await Translate.word(target.lookup);
         if (!info && target.form && target.form !== target.lookup) info = await Translate.word(target.form);
 
+        const english = new Set([
+            ...String(target.form || "").split(" "), ...String(target.lookup || "").split(" "), target.key
+        ].filter(Boolean).map(w => fold(w)));
+        const untranslated = text => {
+            const words = foldedWords(text, 1);
+            return !words.length || words.every(w => english.has(w));
+        };
         const hinted = target.posHint || "";
         const groups = [...(info?.dictionary || [])]
             .sort((a, b) => (b.pos === hinted) - (a.pos === hinted));
         const options = [];
         groups.forEach(group => group.terms.forEach(term => options.push({ term, pos: group.pos })));
         if (info?.translation) options.push({ term: info.translation, pos: "" });
+        for (let i = options.length - 1; i >= 0; i--) if (untranslated(options[i].term)) options.splice(i, 1);
 
         let match = null;
         if (translated) {
@@ -857,7 +870,10 @@
         if (!gloss && hinted) {
             gloss = groups.find(group => group.pos === hinted)?.terms[0] || "";
         }
-        if (!gloss) gloss = info?.translation || options[0]?.term || "";
+        if (!gloss) gloss = options.find(o => o.term === info?.translation)?.term || options[0]?.term || "";
+        // Never keep the English word itself as its "translation": leave it
+        // empty so the word is retried when the translator answers again.
+        if (untranslated(gloss)) gloss = "";
         gloss = gloss.toLowerCase();
 
         const sense = chooseSense(target.senses || [], gloss, sentenceTranslation, match?.pos || hinted);
@@ -947,7 +963,7 @@
     // Bump whenever the way meanings/phrasal verbs are chosen improves: every
     // word already in the library is then re-checked automatically, so nobody
     // keeps studying a meaning the old logic got wrong.
-    const MEANING_VERSION = 5;
+    const MEANING_VERSION = 6;
 
     function newRecord(target, now) {
         return {
@@ -999,7 +1015,7 @@
                             definition: meaning.definition,
                             pos: meaning.pos,
                             senseId: meaning.senseId,
-                            mv: MEANING_VERSION
+                            mv: meaning.gloss ? MEANING_VERSION : 0
                         });
                     }
                     await Store.put(record);
@@ -1007,7 +1023,9 @@
                 }).catch(error => console.error("save failed", error));
                 return saveChain;
             })
-            .finally(() => enrich(target.key).then(() => ensureExtras(target.key)));
+            .finally(() => enrich(target.key)
+                .then(refreshOutdated)                     // retries a meaning that failed
+                .then(() => ensureExtras(target.key)));
     }
 
     const enriching = new Set();
@@ -1024,24 +1042,8 @@
                     const translation = await Translate.sentence(context.sentence);
                     if (translation) { context.translation = translation; changed = true; }
                 }
-                if (!context.gloss && !context.definition) {
-                    const meaning = record.phrase
-                        ? await explainTarget({
-                            key: record.key, form: context.form, lookup: record.lookup || record.key, senses: record.senses || []
-                        }, context.translation)
-                        : await explain(context.form, context.sentence, context.translation);
-                    if (meaning.gloss || meaning.definition) {
-                        Object.assign(context, {
-                            gloss: meaning.gloss,
-                            definition: meaning.definition,
-                            pos: meaning.pos,
-                            senseId: meaning.senseId,
-                            mv: MEANING_VERSION
-                        });
-                        if (!record.phrase && record.headword === record.key && meaning.headword) record.headword = meaning.headword;
-                        changed = true;
-                    }
-                }
+                // Meanings are (re)computed by refreshContext, which knows the
+                // exact words around the tap (see refreshOutdated).
             }
             if (changed) {
                 const latest = await Store.get(key);
@@ -1169,7 +1171,7 @@
             : (context.translation || await Translate.sentence(sentence));
         if (shortened && !translation) return false;                 // offline: try again later
         const meaning = await explainTarget(target, translation);
-        if (!meaning.gloss && !meaning.definition) return false;   // offline: try again later
+        if (!meaning.gloss) return false;                           // translator unavailable: try again later
 
         const updated = {
             ...context,
@@ -1208,7 +1210,7 @@
     async function enrichPending() {
         const all = await Store.all();
         for (const record of all) {
-            if (record.contexts.some(c => !c.translation || (!c.gloss && !c.definition))) {
+            if (record.contexts.some(c => !c.translation)) {
                 await enrich(record.key);
             }
         }
