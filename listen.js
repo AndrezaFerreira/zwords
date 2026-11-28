@@ -17,7 +17,11 @@
     "use strict";
 
     // Shown in "Minhas palavras" and compared with the server on every load.
-    const APP_VERSION = "17";
+    const APP_VERSION = "18";
+
+    // Small free service (Cloudflare Worker, see tools/transcript-worker/) that
+    // reads YouTube's own captions, which a website cannot read directly.
+    const TRANSCRIPT_API = "https://zwords-transcript.zwords-api.workers.dev/transcript";
 
     const $ = id => document.getElementById(id);
 
@@ -39,7 +43,13 @@
         detailBody: $("detailBody"),
         review: $("review"),
         reviewBody: $("reviewBody"),
-        reviewTitle: $("reviewTitle")
+        reviewTitle: $("reviewTitle"),
+        videoButton: $("openVideo"),
+        videoPanel: $("videoPanel"),
+        videoForm: $("videoForm"),
+        videoUrl: $("videoUrl"),
+        videoFrame: $("videoFrame"),
+        videoStatus: $("videoStatus")
     };
 
 
@@ -1615,11 +1625,14 @@
 
     function markCurrent() {
         els.lines.querySelectorAll(".line.current").forEach(el => el.classList.remove("current"));
-        const target = interim.text ? interim.el : lines[lines.length - 1]?.el;
+        const target = Video.active && Video.currentLine()
+            ? Video.currentLine().el
+            : (interim.text ? interim.el : lines[lines.length - 1]?.el);
         target?.classList.add("current");
     }
 
     function scrollToLive(force = false) {
+        if (Video.active && Video.currentLine()) return;          // the video keeps its own position
         if (!followLive && !force) return;
         requestAnimationFrame(() => {
             els.captions.scrollTop = els.captions.scrollHeight;
@@ -1629,7 +1642,7 @@
     els.captions.addEventListener("scroll", () => {
         const distance = els.captions.scrollHeight - els.captions.scrollTop - els.captions.clientHeight;
         followLive = distance < 80;
-        els.jumpLive.hidden = followLive || lines.length === 0;
+        els.jumpLive.hidden = followLive || lines.length === 0 || Video.active;
     }, { passive: true });
 
     els.jumpLive.addEventListener("click", () => {
@@ -1639,6 +1652,11 @@
     });
 
     els.lines.addEventListener("click", event => {
+        const seek = event.target.closest(".seek");
+        if (seek) {
+            Video.seek(Number(seek.dataset.start));
+            return;
+        }
         const span = event.target.closest(".w");
         if (!span) return;
         const lineEl = span.closest(".line");
@@ -1822,8 +1840,9 @@
         });
         lines.forEach(line => {
             setPt(line.el, line.text, line.translation);
-            if (!line.translation && mode !== "en") translateLine(line);
+            if (!line.translation && mode !== "en" && !("start" in line)) translateLine(line);
         });
+        Video.translateNearby();
         if (interim.el && interim.text) setPt(interim.el, interim.text, interim.translation);
     }
 
@@ -2359,6 +2378,261 @@
 
 
     // ============================================================
+    // VIDEO (YouTube player + its own captions, synced and tappable)
+    // ============================================================
+
+    function resetCaptions() {
+        lines.forEach(line => line.el.remove());
+        lines.length = 0;
+        interim.text = "";
+        if (interim.el) interim.el.hidden = true;
+        Bubble.hide();
+    }
+
+    function formatTime(seconds) {
+        const s = Math.max(0, Math.floor(seconds));
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = String(s % 60).padStart(2, "0");
+        return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+    }
+
+    /** YouTube cues are short fragments: join them into readable subtitle lines. */
+    function groupCues(cues) {
+        const blocks = [];
+        let current = null;
+        for (const cue of cues) {
+            const text = String(cue.text || "").replace(/\s+/g, " ").trim();
+            if (!text || /^\[[^\]]*\]$/.test(text)) continue;             // "[Music]"
+            const gap = current ? cue.start - current.end : 0;
+            const words = current ? current.text.split(" ").length : 0;
+            const closed = current && (/[.!?]["”']?$/.test(current.text) && words >= 6);
+            if (!current || closed || words >= 16 || gap > 2) {
+                if (current) blocks.push(current);
+                current = { start: cue.start, end: cue.start + (cue.dur || 2), text };
+            } else {
+                current.text += " " + text;
+                current.end = cue.start + (cue.dur || 2);
+            }
+        }
+        if (current) blocks.push(current);
+        return blocks;
+    }
+
+    function addCueLines(blocks) {
+        els.empty.hidden = true;
+        blocks.forEach(block => {
+            const line = { id: ++lineSeq, text: block.text, translation: Translate.cached(block.text), el: null, start: block.start };
+            line.el = lineElement(block.text, "cue");
+            line.el.dataset.id = line.id;
+            const seek = document.createElement("button");
+            seek.type = "button";
+            seek.className = "seek";
+            seek.dataset.start = String(block.start);
+            seek.textContent = formatTime(block.start);
+            seek.setAttribute("aria-label", `Ir para ${formatTime(block.start)}`);
+            line.el.prepend(seek);
+            setPt(line.el, line.text, line.translation);
+            els.lines.insertBefore(line.el, ensureInterimElement());
+            lines.push(line);
+        });
+    }
+
+    const Video = (() => {
+        let player = null;
+        let apiPromise = null;
+        let timer = null;
+        let current = null;
+        let active = false;
+        let lastManualScroll = 0;
+
+        ["touchmove", "wheel"].forEach(type => els.captions.addEventListener(type, () => {
+            lastManualScroll = Date.now();
+        }, { passive: true }));
+
+        function status(message) {
+            els.videoStatus.textContent = message || "";
+            els.videoStatus.hidden = !message;
+        }
+
+        function parseId(text) {
+            const value = String(text || "").trim();
+            if (/^[\w-]{11}$/.test(value)) return value;
+            try {
+                const url = new URL(value);
+                if (url.hostname.endsWith("youtu.be")) return url.pathname.slice(1, 12);
+                if (url.searchParams.get("v")) return url.searchParams.get("v").slice(0, 11);
+                const match = url.pathname.match(/\/(?:shorts|embed|live|v)\/([\w-]{11})/);
+                return match ? match[1] : "";
+            } catch (error) {
+                return "";
+            }
+        }
+
+        function loadApi() {
+            if (window.YT?.Player) return Promise.resolve();
+            if (!apiPromise) {
+                apiPromise = new Promise((resolve, reject) => {
+                    const previous = window.onYouTubeIframeAPIReady;
+                    window.onYouTubeIframeAPIReady = () => {
+                        if (typeof previous === "function") previous();
+                        resolve();
+                    };
+                    const script = document.createElement("script");
+                    script.src = "https://www.youtube.com/iframe_api";
+                    script.onerror = () => { apiPromise = null; reject(new Error("youtube api")); };
+                    document.head.append(script);
+                });
+            }
+            return apiPromise;
+        }
+
+        async function fetchTranscript(id) {
+            try {
+                const response = await fetchWithTimeout(`${TRANSCRIPT_API}?v=${encodeURIComponent(id)}&lang=en`, 25000);
+                if (!response.ok) return null;
+                const data = await response.json();
+                return data?.cues?.length ? data : null;
+            } catch (error) {
+                return null;
+            }
+        }
+
+        async function open(text) {
+            const id = parseId(text);
+            if (!id) {
+                status("Esse link não parece ser de um vídeo do YouTube.");
+                return;
+            }
+            try { localStorage.setItem("zwl_last_video", text); } catch (error) { /* ignore */ }
+            active = true;
+            current = null;
+            els.app.classList.add("video-mode");
+            els.videoFrame.hidden = false;
+            resetCaptions();
+            status("Buscando a legenda do YouTube…");
+            try {
+                await loadApi();
+                if (player?.cueVideoById) {
+                    player.cueVideoById(id);
+                } else {
+                    player = new YT.Player("ytPlayer", {
+                        videoId: id,
+                        playerVars: { playsinline: 1, rel: 0, modestbranding: 1, cc_load_policy: 0 },
+                        events: { onStateChange: onState }
+                    });
+                }
+            } catch (error) {
+                status("Não foi possível carregar o player do YouTube (precisa de internet).");
+                return;
+            }
+            const data = await fetchTranscript(id);
+            if (!active) return;
+            if (!data) {
+                status("A legenda do YouTube não está disponível para este vídeo. Toque no microfone para legendar pelo áudio.");
+                return;
+            }
+            addCueLines(groupCues(data.cues));
+            status(data.auto ? "Legenda automática do YouTube." : "");
+            sync();
+        }
+
+        function close() {
+            active = false;
+            current = null;
+            stopSync();
+            try { player?.pauseVideo?.(); } catch (error) { /* ignore */ }
+            els.app.classList.remove("video-mode");
+        }
+
+        function onState(event) {
+            if (event.data === YT.PlayerState.PLAYING) startSync();
+            else stopSync();
+            sync();
+        }
+
+        function startSync() {
+            stopSync();
+            timer = setInterval(sync, 250);
+        }
+
+        function stopSync() {
+            clearInterval(timer);
+            timer = null;
+        }
+
+        function cueLines() {
+            return lines.filter(line => "start" in line);
+        }
+
+        function sync() {
+            if (!active || !player?.getCurrentTime) return;
+            const cues = cueLines();
+            if (!cues.length) return;
+            const time = player.getCurrentTime() + 0.2;
+            let low = 0;
+            let high = cues.length - 1;
+            let index = -1;
+            while (low <= high) {
+                const mid = (low + high) >> 1;
+                if (cues[mid].start <= time) { index = mid; low = mid + 1; } else { high = mid - 1; }
+            }
+            const line = cues[Math.max(index, 0)];
+            if (line === current) return;
+            current = line;
+            markCurrent();
+            translateNearby();
+            if (Date.now() - lastManualScroll > 5000) {
+                line.el.scrollIntoView({ block: "center", behavior: "smooth" });
+            }
+        }
+
+        /** Translate only what is about to be read (saves the free translators). */
+        function translateNearby() {
+            if (!active || mode === "en") return;
+            const cues = cueLines();
+            const start = Math.max(cues.indexOf(current), 0);
+            cues.slice(start, start + 4).forEach(line => {
+                if (!line.translation && !line.translating) {
+                    line.translating = true;
+                    translateLine(line).finally(() => { line.translating = false; });
+                }
+            });
+        }
+
+        function seek(seconds) {
+            if (!player?.seekTo || !Number.isFinite(seconds)) return;
+            player.seekTo(seconds, true);
+            player.playVideo?.();
+        }
+
+        return {
+            open, close, seek, translateNearby,
+            get active() { return active; },
+            currentLine: () => current
+        };
+    })();
+
+    els.videoButton.addEventListener("click", () => {
+        const opening = els.videoPanel.hidden;
+        els.videoPanel.hidden = !opening;
+        els.videoButton.setAttribute("aria-pressed", String(opening));
+        if (opening) {
+            try { els.videoUrl.value = els.videoUrl.value || localStorage.getItem("zwl_last_video") || ""; } catch (error) { /* ignore */ }
+            if (!els.videoUrl.value) els.videoUrl.focus();
+        } else {
+            Video.close();
+        }
+    });
+
+    els.videoForm.addEventListener("submit", event => {
+        event.preventDefault();
+        els.videoUrl.blur();
+        Video.open(els.videoUrl.value);
+    });
+
+
+    // ============================================================
     // START
     // ============================================================
 
@@ -2403,6 +2677,6 @@
     ensureLatestVersion();
 
     // Exposed for automated tests only.
-    window.__zwordsListen = { WikiTranslations, Wiki, ensureExtras, newSenses, markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
+    window.__zwordsListen = { Video, groupCues, WikiTranslations, Wiki, ensureExtras, newSenses, markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
 
 })();

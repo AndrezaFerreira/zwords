@@ -164,6 +164,96 @@ button {
     line-height: 16px;
 }
 
+/* ---------- video ---------- */
+
+.video {
+    padding: 0 16px 8px;
+}
+
+.video-form {
+    display: flex;
+    gap: 8px;
+}
+
+.video-form input {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 14px;
+    border: 0;
+    border-radius: 12px;
+    background: var(--surface-2);
+    font-size: 1rem;
+    outline: none;
+}
+
+.video-form button {
+    padding: 10px 16px;
+    border: 0;
+    border-radius: 12px;
+    background: var(--accent);
+    color: #fff;
+    font-weight: 700;
+}
+
+.video-frame {
+    position: relative;
+    margin-top: 10px;
+    overflow: hidden;
+    border-radius: 14px;
+    background: #000;
+    aspect-ratio: 16 / 9;
+}
+
+.video-frame iframe,
+.video-frame #ytPlayer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+}
+
+.video-status {
+    margin: 8px 2px 0;
+    color: var(--text-2);
+    font-size: 0.82rem;
+    line-height: 1.4;
+}
+
+.icon-button[aria-pressed="true"] svg {
+    fill: var(--accent);
+}
+
+.seek {
+    display: inline-block;
+    margin: 0 0 4px;
+    padding: 1px 8px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-3);
+    font-size: 0.72rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.video-mode .line.current .seek {
+    background: var(--accent-soft);
+    color: var(--accent-text);
+}
+
+.video-mode .lines {
+    gap: 16px;
+}
+
+.video-mode .line .en {
+    font-size: calc(var(--caption-size) * 0.78);
+}
+
+.video-mode .line.current .en {
+    font-size: calc(var(--caption-size) * 0.9);
+}
+
 /* ---------- captions ---------- */
 
 .captions {
@@ -838,4 +928,23 @@ button {
         animation: none !important;
         transition: none !important;
     }
+}
+
+/* In video mode the microphone is only the fallback: keep it small. */
+.video-mode .controls {
+    padding-top: 4px;
+}
+
+.video-mode .mic {
+    width: 52px;
+    height: 52px;
+}
+
+.video-mode .mic svg {
+    width: 24px;
+    height: 24px;
+}
+
+.video-mode .mic-label {
+    display: none;
 }
