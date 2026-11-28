@@ -466,6 +466,85 @@
 
 
     // ============================================================
+    // MORE SENSES (Wiktionary, free and open: CC BY-SA)
+    // ============================================================
+
+    const Wiki = (() => {
+        const SKIP_LABEL = /\b(obsolete|archaic|dated|historical|nonstandard|rare|uncommon)\b/i;
+        const FORM_OF = /^(plural of|(simple )?past (tense|participle) of|present participle of|third-person singular|alternative (form|spelling|letter-case form) of|obsolete (form|spelling) of|inflection of|comparative (form )?of|superlative (form )?of|misspelling of|eye dialect|abbreviation of|initialism of|clipping of)/i;
+        const MAX_PER_POS = 6;
+        const MAX_TOTAL = 14;
+
+        function text(html) {
+            const body = new DOMParser().parseFromString(String(html || ""), "text/html").body;
+            return (body.textContent || "").replace(/\s+/g, " ").trim();
+        }
+
+        async function fetchEntry(title) {
+            const url = "https://en.wiktionary.org/api/rest_v1/page/definition/" + encodeURIComponent(title.replace(/ /g, "_"));
+            const response = await fetchWithTimeout(url, 10000);
+            if (response.status === 404) return [];
+            if (!response.ok) throw new Error("wiktionary " + response.status);
+            const data = await response.json();
+            return data.en || [];
+        }
+
+        /** English senses: [[pos, definition]], [] if none, null if offline. */
+        async function senses(term) {
+            const titles = [term];
+            if (term === term.toLowerCase()) titles.push(term[0].toUpperCase() + term.slice(1));
+            let groups = [];
+            try {
+                for (const title of titles) {
+                    groups = await fetchEntry(title);
+                    if (groups.length) break;
+                }
+            } catch (error) {
+                return null;
+            }
+            const out = [];
+            for (const group of groups) {
+                const pos = String(group.partOfSpeech || "").toLowerCase();
+                let count = 0;
+                for (const item of group.definitions || []) {
+                    const definition = text(item.definition);
+                    const label = (definition.match(/^\(([^)]*)\)/) || [])[1] || "";
+                    if (!definition || definition.length < 4 || SKIP_LABEL.test(label) || FORM_OF.test(definition)) continue;
+                    out.push([pos, definition]);
+                    if (++count >= MAX_PER_POS || out.length >= MAX_TOTAL) break;
+                }
+                if (out.length >= MAX_TOTAL) break;
+            }
+            return out;
+        }
+
+        return { senses };
+    })();
+
+    /** Extra senses that are not already said by ZWords' own dictionary. */
+    function newSenses(base, extras) {
+        const kept = [];
+        const signature = definition => new Set(contentWords(definition).map(stem));
+        const known = base.map(([, definition]) => signature(definition));
+        for (const extra of extras) {
+            const mine = signature(extra[1]);
+            if (!mine.size) continue;
+            const duplicate = known.some(other => {
+                if (!other.size) return false;
+                let shared = 0;
+                mine.forEach(s => { if (other.has(s)) shared++; });
+                return shared / Math.min(mine.size, other.size) >= 0.6;
+            });
+            if (!duplicate) {
+                kept.push(extra);
+                known.push(mine);
+            }
+        }
+        return kept;
+    }
+
+
+    // ============================================================
     // TRANSLATION (free; on-device when the browser offers it)
     // ============================================================
 
@@ -615,7 +694,33 @@
             });
         }
 
-        return { prepareOnDevice, sentence, word, cached, marked };
+        /** Translates several short texts with one request when possible. */
+        async function lines(texts) {
+            if (!texts.length) return [];
+            const joined = texts.join("\n");
+            const key = "l:" + joined;
+            if (cache.has(key)) return cache.get(key);
+            let result = null;
+            try {
+                const translated = await limited(() => google(joined, false));
+                const parts = translated.translation.split("\n").map(part => part.trim());
+                if (parts.length === texts.length) result = parts;
+            } catch (error) {
+                result = null;
+            }
+            if (!result) {
+                result = [];
+                for (const text of texts) {
+                    const translated = await sentence(text);
+                    if (!translated) return null;
+                    result.push(translated);
+                }
+            }
+            remember(key, result);
+            return result;
+        }
+
+        return { prepareOnDevice, sentence, word, cached, marked, lines };
     })();
 
 
@@ -755,27 +860,7 @@
         if (!gloss) gloss = info?.translation || options[0]?.term || "";
         gloss = gloss.toLowerCase();
 
-        let sense = null;
-        const senses = target.senses || [];
-        if (senses.length) {
-            const glossStems = foldedWords(gloss, 3).map(stem);
-            let best = -1;
-            let bestEvidence = 0;
-            senses.forEach(candidate => {
-                const [pos, definition] = candidate;
-                const defStems = contentWords(definition).map(stem);
-                let evidence = 0;
-                defStems.forEach(s => { if (translatedStems.has(s)) evidence += 1; });
-                glossStems.forEach(s => { if (defStems.some(d => d.startsWith(s) || s.startsWith(d))) evidence += 3; });
-                let score = evidence;
-                const wanted = (match?.pos || hinted).toLowerCase();
-                if (wanted && pos && wanted === String(pos).toLowerCase()) score += 2;
-                if (score > best) { best = score; bestEvidence = evidence; sense = candidate; }
-            });
-            // Only the words of the sentence count as evidence; the part of
-            // speech alone could still point to the wrong sense.
-            if (bestEvidence <= 0 && senses.length > 1) sense = null;
-        }
+        const sense = chooseSense(target.senses || [], gloss, sentenceTranslation, match?.pos || hinted);
 
         return {
             gloss,
@@ -783,6 +868,33 @@
             definition: sense ? sense[1] : "",
             senseId: sense ? sense[3] : ""
         };
+    }
+
+    /**
+     * The sense whose definition shares words with the sentence translation
+     * or the contextual gloss. Part of speech only breaks ties: it is never
+     * enough on its own to show a definition.
+     */
+    function chooseSense(senses, gloss, sentenceTranslation, wantedPos) {
+        if (!senses.length) return null;
+        const translatedStems = new Set(contentWords(sentenceTranslation).map(stem));
+        const glossStems = foldedWords(gloss, 3).map(stem);
+        const wanted = String(wantedPos || "").toLowerCase();
+        let sense = null;
+        let best = -1;
+        let bestEvidence = 0;
+        senses.forEach(candidate => {
+            const [pos, definition] = candidate;
+            const defStems = contentWords(definition).map(stem);
+            let evidence = 0;
+            defStems.forEach(s => { if (translatedStems.has(s)) evidence += 1; });
+            glossStems.forEach(s => { if (defStems.some(d => d.startsWith(s) || s.startsWith(d))) evidence += 3; });
+            let score = evidence;
+            if (wanted && pos && wanted === String(pos).toLowerCase()) score += 2;
+            if (score > best) { best = score; bestEvidence = evidence; sense = candidate; }
+        });
+        if (bestEvidence <= 0 && senses.length > 1) return null;
+        return sense;
     }
 
     /** Single-word meaning (used for retries of older entries). */
@@ -895,7 +1007,7 @@
                 }).catch(error => console.error("save failed", error));
                 return saveChain;
             })
-            .finally(() => enrich(target.key));
+            .finally(() => enrich(target.key).then(() => ensureExtras(target.key)));
     }
 
     const enriching = new Set();
@@ -945,6 +1057,60 @@
             console.error("enrich failed", error);
         } finally {
             enriching.delete(key);
+        }
+    }
+
+    const EXTRA_VERSION = 1;
+    const extrasInFlight = new Set();
+
+    /** Completes a saved word with every sense Wiktionary has (translated). */
+    async function ensureExtras(key) {
+        if (extrasInFlight.has(key)) return false;
+        extrasInFlight.add(key);
+        try {
+            const record = await Store.get(key);
+            if (!record || record.extra?.v === EXTRA_VERSION) return false;
+            const term = record.phrase ? (record.lookup || record.key) : record.key;
+            const english = await Wiki.senses(term);
+            if (english === null) return false;                       // offline: later
+            let extras = [];
+            if (english.length) {
+                const translated = await Translate.lines(english.map(([, definition]) => definition));
+                if (!translated) return false;                         // offline: later
+                const base = record.phrase ? (record.senses || []) : ((await Dict.entry(record.key))?.[1] || []);
+                extras = newSenses(base, english.map(([pos], i) => [pos, translated[i], "wiktionary", ""]));
+            }
+            const latest = await Store.get(key);
+            if (!latest) return false;
+            latest.extra = { v: EXTRA_VERSION, senses: extras };
+            // Contexts that had no definition may now find one that fits.
+            if (extras.length) {
+                const base = latest.phrase ? (latest.senses || []) : ((await Dict.entry(latest.key))?.[1] || []);
+                latest.contexts.forEach(context => {
+                    if (context.definition) return;
+                    const sense = chooseSense([...base, ...extras], context.gloss, context.translation, context.pos);
+                    if (sense) {
+                        context.definition = sense[1];
+                        context.pos = context.pos || sense[0];
+                    }
+                });
+            }
+            await Store.put(latest);
+            refreshOpenViews(key);
+            return true;
+        } catch (error) {
+            console.error("extra senses failed", error);
+            return false;
+        } finally {
+            extrasInFlight.delete(key);
+        }
+    }
+
+    async function ensureAllExtras() {
+        if (!navigator.onLine) return;
+        const all = await Store.all();
+        for (const record of all) {
+            if (record.extra?.v !== EXTRA_VERSION) await ensureExtras(record.key);
         }
     }
 
@@ -1594,7 +1760,7 @@
     $("openLibrary").addEventListener("click", async () => {
         await renderLibrary();
         openSheet(els.library);
-        enrichPending().then(refreshOutdated);
+        enrichPending().then(refreshOutdated).then(ensureAllExtras);
     });
 
     $("closeLibrary").addEventListener("click", () => closeSheet(els.library));
@@ -1618,6 +1784,10 @@
             ? (record.senses?.length ? [record.headword, record.senses] : null)
             : await Dict.entry(record.key).catch(() => null);
 
+        const extraSenses = record.extra?.senses || [];
+        const allSenses = [...(entry ? entry[1] : []), ...extraSenses];
+        if (!record.extra) ensureExtras(record.key);
+
         els.detailBody.innerHTML = `
             <div class="detail-head">
                 <h3>${escapeHtml(record.headword)}</h3>
@@ -1637,11 +1807,13 @@
                     </div>
                 </article>`).join("")}
 
-            ${entry ? `
-                <p class="section-label">Todos os sentidos no ZWords</p>
+            ${allSenses.length ? `
+                <p class="section-label">Todos os sentidos</p>
                 <ol class="senses">
-                    ${entry[1].map(([pos, definition]) => `<li>${escapeHtml(definition)} <em>${escapeHtml(posLabel(pos))}</em></li>`).join("")}
-                </ol>` : ""}
+                    ${allSenses.map(([pos, definition, source]) => `<li>${escapeHtml(definition)} <em>${escapeHtml(posLabel(pos))}${source === "wiktionary" ? " · Wiktionary" : ""}</em></li>`).join("")}
+                </ol>
+                ${extraSenses.length ? `<p class="source-note">Sentidos marcados com Wiktionary: dicionário aberto (CC BY-SA), traduzidos automaticamente.</p>` : ""}`
+                : (record.extra ? "" : `<p class="source-note">Buscando todos os sentidos…</p>`)}
         `;
         openSheet(els.detail);
     }
@@ -1826,14 +1998,14 @@
 
     setMode(mode);
     checkSupport();
-    loadSavedForms().then(enrichPending).then(refreshOutdated);
-    window.addEventListener("online", () => enrichPending().then(refreshOutdated));
+    loadSavedForms().then(enrichPending).then(refreshOutdated).then(ensureAllExtras);
+    window.addEventListener("online", () => enrichPending().then(refreshOutdated).then(ensureAllExtras));
 
     if ("serviceWorker" in navigator) {
         navigator.serviceWorker.register("./service-worker.js?v=20260913-3").catch(() => {});
     }
 
     // Exposed for automated tests only.
-    window.__zwordsListen = { markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
+    window.__zwordsListen = { Wiki, ensureExtras, newSenses, markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
 
 })();
