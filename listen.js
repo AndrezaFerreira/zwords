@@ -244,6 +244,9 @@
     // DICTIONARY (ZWords pt-BR senses, sharded by 2 letters)
     // ============================================================
 
+    // Bump when data/listen is rebuilt: a new URL bypasses every cached copy.
+    const DICT_VERSION = "2";
+
     const Dict = (() => {
         const shards = new Map();
         let formsPromise = null;
@@ -264,7 +267,7 @@
         function shard(key) {
             const name = shardName(key);
             if (!shards.has(name)) {
-                const promise = loadJson(`data/listen/${name}.json`).then(data => {
+                const promise = loadJson(`data/listen/${name}.json?v=${DICT_VERSION}`).then(data => {
                     if (data === null) shards.delete(name);   // offline: retry later
                     return data || {};
                 });
@@ -275,7 +278,7 @@
 
         function forms() {
             if (!formsPromise) {
-                formsPromise = loadJson("data/listen/forms.json").then(data => {
+                formsPromise = loadJson(`data/listen/forms.json?v=${DICT_VERSION}`).then(data => {
                     if (data === null) formsPromise = null;
                     return data || {};
                 });
@@ -353,7 +356,7 @@
 
         function load() {
             if (!promise) {
-                promise = fetchWithTimeout("data/listen/phrasal.json", 15000)
+                promise = fetchWithTimeout(`data/listen/phrasal.json?v=${DICT_VERSION}`, 15000)
                     .then(r => (r.ok ? r.json() : {}))
                     .catch(() => { promise = null; return {}; });
             }

@@ -3,7 +3,7 @@
 // ============================================================
 
 const STATIC_CACHE =
-    "zwords-static-v20261128-listen13";
+    "zwords-static-v20261128-listen14";
 
 const MEDIA_CACHE =
     "zwords-media-v1";
@@ -157,6 +157,27 @@ self.addEventListener(
         // JSON DATA
         // Cache first with ignoreSearch
         // ====================================================
+
+        // ====================================================
+        // "OUVIR" DICTIONARY: versioned URLs (?v=), cached per
+        // exact URL so a new version is always downloaded.
+        // ====================================================
+
+        if (
+            pathname.includes(
+                "/data/listen/"
+            )
+        ) {
+
+            event.respondWith(
+                versionedRequest(
+                    event.request
+                )
+            );
+
+            return;
+        }
+
 
         if (
             pathname.includes(
@@ -379,6 +400,70 @@ async function staticRequest(
                 status:
                     504,
 
+                statusText:
+                    "Offline resource unavailable"
+            }
+        );
+
+    }
+
+}
+
+
+// ============================================================
+// VERSIONED (Ouvir dictionary): cache first, exact URL
+// ============================================================
+
+async function versionedRequest(
+    request
+) {
+
+    const cache =
+        await caches.open(
+            STATIC_CACHE
+        );
+
+    const cached =
+        await cache.match(
+            request
+        );
+
+    if (
+        cached
+    ) {
+        return cached;
+    }
+
+    try {
+
+        const response =
+            await fetch(
+                request,
+                { cache: "no-cache" }
+            );
+
+        if (
+            response
+            &&
+            response.ok
+        ) {
+            await cache.put(
+                request,
+                response.clone()
+            );
+        }
+
+        return response;
+
+    } catch (
+        error
+    ) {
+
+        return new Response(
+            "",
+            {
+                status:
+                    504,
                 statusText:
                     "Offline resource unavailable"
             }
