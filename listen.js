@@ -750,15 +750,78 @@
     // MEANING IN CONTEXT
     // ============================================================
 
+    // ---------- One format for every screen ----------
+
     const POS_PT = {
         noun: "substantivo", verb: "verbo", adjective: "adjetivo", adverb: "advérbio",
         pronoun: "pronome", preposition: "preposição", conjunction: "conjunção",
         interjection: "interjeição", determiner: "determinante", article: "artigo",
-        "phrasal verb": "phrasal verb", abbreviation: "abreviação", exclamation: "exclamação"
+        "phrasal verb": "phrasal verb", abbreviation: "abreviação", exclamation: "exclamação",
+        "proper noun": "nome próprio", "verb phrase": "expressão verbal", idiom: "expressão idiomática",
+        phrase: "expressão", "noun phrase": "expressão", "adverb phrase": "expressão",
+        "adverbial phrase": "expressão", "prepositional phrase": "expressão", "adjective phrase": "expressão",
+        numeral: "numeral", particle: "partícula", prefix: "prefixo", suffix: "sufixo",
+        contraction: "contração", symbol: "símbolo"
     };
 
+    /** Part of speech, always in Portuguese and lowercase. */
     function posLabel(pos) {
-        return POS_PT[String(pos || "").toLowerCase()] || pos || "";
+        const key = String(pos || "").toLowerCase().trim();
+        return POS_PT[key] || key;
+    }
+
+    /** Translations/glosses: lowercase, no trailing punctuation. */
+    function cleanGloss(text) {
+        return String(text || "").replace(/\s+/g, " ").trim().replace(/[\s.;:!?,…]+$/, "").toLowerCase();
+    }
+
+    /** Definitions: capital first letter, final period, no dangling "Para" before a verb. */
+    function cleanDefinition(text) {
+        let out = String(text || "").replace(/\s+/g, " ").trim();
+        out = out.replace(/^para\s+(?=[\p{L}-]+(?:ar|er|ir|or|ar-se|er-se|ir-se)\b)/iu, "");
+        if (!out) return "";
+        out = out[0].toUpperCase() + out.slice(1);
+        return /[.!?…)]$/.test(out) ? out : out + ".";
+    }
+
+    /** "prosperar · dar lucro · crescer vigorosamente" */
+    function joinTop(words) {
+        return words.map(cleanGloss).filter(Boolean).slice(0, 3).join(" · ");
+    }
+
+    /** Part of speech of a tap/target, for the header. */
+    function targetPos(target, pick) {
+        if (target.isPhrase) return phrasePos(target.senses);
+        return pick?.pos || target.translations?.[0]?.[1] || target.senses?.[0]?.[0] || "";
+    }
+
+    /** Multi-word verbs are always "phrasal verb"; idioms keep their own label. */
+    function phrasePos(senses) {
+        const pos = String(senses?.[0]?.[0] || "").toLowerCase();
+        return !pos || pos === "verb" || pos === "phrasal verb" ? "phrasal verb" : pos;
+    }
+
+    function headerLabel(headword, pos) {
+        const label = posLabel(pos);
+        return label ? `${headword} · ${label}` : headword;
+    }
+
+    /** Everything a saved word shows, computed the same way everywhere. */
+    async function wordProfile(record) {
+        const own = await Dict.entry(record.key).catch(() => null);
+        const translations = own?.[2] || [];
+        const senses = record.phrase ? (record.senses || []) : (own?.[1] || []);
+        const pos = record.phrase
+            ? phrasePos(senses)
+            : (record.contexts.find(c => c.pos)?.pos || translations[0]?.[1] || senses[0]?.[0] || "");
+        let top = translations.slice(0, 3).map(([text]) => text);
+        if (!top.length) {
+            top = [...new Set([...record.contexts].reverse().map(c => cleanGloss(c.gloss)).filter(Boolean))].slice(0, 3);
+        }
+        const allSenses = [...senses, ...(record.extra?.senses || [])];
+        // Same rule as the balloon: translations, else the first definition.
+        const summary = joinTop(top) || cleanDefinition(allSenses[0]?.[1]) || "";
+        return { headword: record.headword, pos, top, summary, translations, senses: allSenses };
     }
 
     const SUBJECTS = new Set(["i", "you", "we", "they", "he", "she", "it", "who", "people"]);
@@ -897,7 +960,7 @@
         const pick = pickTranslations(target, sentenceTranslation);
         let gloss = contextual || pick.contextual || pick.top[0] || "";
         if (untranslated(gloss)) gloss = "";
-        gloss = gloss.toLowerCase();
+        gloss = cleanGloss(gloss);
 
         const sense = chooseSense(target.senses || [], gloss, sentenceTranslation, pick.pos || target.posHint);
         return {
@@ -1462,8 +1525,8 @@
     function showDictionaryFallback(bubble, target) {
         const senses = target.senses || [];
         const sense = senses.find(([pos]) => target.posHint && String(pos).toLowerCase() === target.posHint) || senses[0];
-        Bubble.label(bubble, target.isPhrase ? target.headword : "");
-        Bubble.fill(bubble, sense ? sense[1] : "salva ✓");
+        Bubble.label(bubble, headerLabel(target.headword, targetPos(target)));
+        Bubble.fill(bubble, sense ? cleanDefinition(sense[1]) : "Salva na biblioteca.");
     }
 
     /** Tap → balloon with the meaning in context + saved to the library. Captions keep running. */
@@ -1496,7 +1559,7 @@
 
         // Instant and offline: the 3 most used translations.
         const pick = pickTranslations(target, translation || Translate.cached(sentence));
-        Bubble.label(bubble, target.isPhrase ? target.headword : "");
+        Bubble.label(bubble, headerLabel(target.headword, targetPos(target, pick)));
         if (pick.top.length) Bubble.fillWords(bubble, pick.top, Boolean(pick.contextual));
         else showDictionaryFallback(bubble, target);
 
@@ -1585,7 +1648,7 @@
         function fillWords(el, words, firstFits) {
             if (current?.el !== el) return;
             const node = el.querySelector(".bubble-text");
-            node.innerHTML = words.map((word, i) => (i === 0 && firstFits
+            node.innerHTML = words.map(cleanGloss).filter(Boolean).slice(0, 3).map((word, i) => (i === 0 && firstFits
                 ? `<strong>${escapeHtml(word)}</strong>`
                 : escapeHtml(word))).join(" · ");
             node.classList.remove("loading");
@@ -1816,13 +1879,6 @@
     // LIBRARY
     // ============================================================
 
-    function latestGloss(record) {
-        const contexts = [...record.contexts].reverse();
-        const withMeaning = contexts.find(c => c.gloss || c.definition);
-        if (!withMeaning) return "…";
-        return withMeaning.gloss || withMeaning.definition;
-    }
-
     async function renderLibrary() {
         const all = await Store.all();
         all.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
@@ -1836,16 +1892,20 @@
             : all;
 
         els.libraryEmpty.hidden = all.length > 0;
-        els.wordList.innerHTML = filtered.map(record => `
+        const profiles = new Map(await Promise.all(filtered.map(async r => [r.key, await wordProfile(r)])));
+        els.wordList.innerHTML = filtered.map(record => {
+            const profile = profiles.get(record.key);
+            return `
             <li>
                 <button type="button" class="word-item" data-key="${escapeHtml(record.key)}">
                     <span class="word-main">
-                        <span class="word-head">${escapeHtml(record.headword)}</span>
-                        <span class="word-gloss">${escapeHtml(latestGloss(record))}</span>
+                        <span class="word-head">${escapeHtml(record.headword)}${profile.pos ? ` <span class="word-pos">${escapeHtml(posLabel(profile.pos))}</span>` : ""}</span>
+                        <span class="word-gloss">${escapeHtml(profile.summary || "…")}</span>
                     </span>
                     ${record.contexts.length > 1 ? `<span class="word-count">${record.contexts.length}</span>` : ""}
                 </button>
-            </li>`).join("")
+            </li>`;
+        }).join("")
             || (all.length ? `<li class="library-empty">Nada encontrado para “${escapeHtml(els.librarySearch.value)}”.</li>` : "");
     }
 
@@ -1890,35 +1950,38 @@
         if (!record.extra) ensureExtras(record.key);
 
         // Every translation from the fixed dictionary, grouped by part of speech.
-        const own = record.phrase ? await Dict.entry(record.key).catch(() => null) : entry;
-        const translations = own?.[2] || [];
+        const profile = await wordProfile(record);
+        const translations = profile.translations;
         const groups = [];
         translations.forEach(([text, pos], i) => {
             let group = groups.find(g => g.pos === pos);
             if (!group) groups.push(group = { pos, items: [] });
-            group.items.push(i < 3 ? `<strong>${escapeHtml(text)}</strong>` : escapeHtml(text));
+            group.items.push(i < 3 ? `<strong>${escapeHtml(cleanGloss(text))}</strong>` : escapeHtml(cleanGloss(text)));
         });
 
         els.detailBody.innerHTML = `
             <div class="detail-head">
-                <h3>${escapeHtml(record.headword)}</h3>
+                <div>
+                    <h3>${escapeHtml(record.headword)}</h3>
+                    ${profile.pos ? `<p class="detail-pos">${escapeHtml(posLabel(profile.pos))}</p>` : ""}
+                </div>
                 <button type="button" class="speak" data-speak="${escapeHtml(record.headword)}" aria-label="Ouvir pronúncia">🔊</button>
             </div>
 
             ${groups.length ? `
                 <div class="translations">
-                    ${groups.map(g => `<p>${g.pos ? `<em>${escapeHtml(posLabel(g.pos))}</em> ` : ""}${g.items.join(", ")}</p>`).join("")}
+                    ${groups.map(g => `<p>${g.pos && groups.length > 1 ? `<em>${escapeHtml(posLabel(g.pos))}</em> ` : ""}${g.items.join(", ")}</p>`).join("")}
                 </div>` : ""}
 
             <p class="section-label">${contexts.length === 1 ? "Onde você encontrou" : `${contexts.length} contextos reais`}</p>
             ${contexts.map(c => `
                 <article class="context">
                     ${c.gloss
-                        ? `<p class="context-gloss">${escapeHtml(c.gloss)}${c.pos ? ` <span class="word-count">${escapeHtml(posLabel(c.pos))}</span>` : ""}</p>`
+                        ? `<p class="context-gloss"><span class="context-label">neste contexto</span> ${escapeHtml(cleanGloss(c.gloss))}</p>`
                         : `<p class="context-definition">Buscando a tradução neste contexto…</p>`}
-                    ${c.definition ? `<p class="context-definition">${escapeHtml(c.definition)}</p>` : ""}
+                    ${c.definition ? `<p class="context-definition">${escapeHtml(cleanDefinition(c.definition))}</p>` : ""}
                     <p class="context-sentence">${highlightForm(c.sentence, c.form)}</p>
-                    <p class="context-translation">${escapeHtml(c.translation || "Traduzindo… (precisa de internet)")}</p>
+                    <p class="context-translation">${escapeHtml(c.translation || "Tradução da frase pendente (precisa de internet).")}</p>
                     <div class="context-meta">
                         <span>${escapeHtml(new Date(c.at).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }))}</span>
                         <button type="button" data-remove="${escapeHtml(c.sentence)}">remover</button>
@@ -1928,7 +1991,7 @@
             ${allSenses.length ? `
                 <p class="section-label">Todos os sentidos</p>
                 <ol class="senses">
-                    ${allSenses.map(([pos, definition, source]) => `<li>${escapeHtml(definition)} <em>${escapeHtml(posLabel(pos))}${source === "wiktionary" ? " · Wiktionary" : ""}</em></li>`).join("")}
+                    ${allSenses.map(([pos, definition, source]) => `<li>${escapeHtml(cleanDefinition(definition))} <em>${escapeHtml(posLabel(pos))}${source === "wiktionary" ? " · Wiktionary" : ""}</em></li>`).join("")}
                 </ol>
                 ${extraSenses.length ? `<p class="source-note">Sentidos marcados com Wiktionary: dicionário aberto (CC BY-SA), traduzidos automaticamente.</p>` : ""}
                 ${groups.length ? `<p class="source-note">Traduções: FreeDict (GPL), ordenadas pelas mais usadas no português.</p>` : ""}`
@@ -2039,7 +2102,7 @@
         renderLibrary();
     });
 
-    function renderReview(total = 0) {
+    async function renderReview(total = 0) {
         const record = reviewQueue[0];
         if (!record) {
             els.reviewTitle.textContent = "Revisão";
@@ -2052,17 +2115,26 @@
             return;
         }
         els.reviewTitle.textContent = `${reviewQueue.length} restante(s)`;
-        const context = record.contexts[Math.floor(Math.random() * record.contexts.length)];
+        if (!record.reviewContext || !record.contexts.includes(record.reviewContext)) {
+            record.reviewContext = record.contexts[Math.floor(Math.random() * record.contexts.length)];
+        }
+        const context = record.reviewContext;
+        const profile = await wordProfile(record);
         els.reviewBody.innerHTML = `
             <div class="card">
-                <h3>${escapeHtml(record.headword)}
+                <div class="detail-head">
+                    <div>
+                        <h3>${escapeHtml(record.headword)}</h3>
+                        ${profile.pos ? `<p class="detail-pos">${escapeHtml(posLabel(profile.pos))}</p>` : ""}
+                    </div>
                     <button type="button" class="speak" data-speak="${escapeHtml(record.headword)}" aria-label="Ouvir pronúncia">🔊</button>
-                </h3>
+                </div>
                 <p class="context-sentence">${highlightForm(context.sentence, context.form)}</p>
                 ${revealed ? `
                     <div class="card-answer">
-                        ${context.gloss ? `<p class="context-gloss">${escapeHtml(context.gloss)}</p>` : ""}
-                        ${context.definition ? `<p class="context-definition">${escapeHtml(context.definition)}</p>` : ""}
+                        ${profile.summary ? `<p class="card-top">${escapeHtml(profile.summary)}</p>` : ""}
+                        ${context.gloss ? `<p class="context-gloss"><span class="context-label">neste contexto</span> ${escapeHtml(cleanGloss(context.gloss))}</p>` : ""}
+                        ${context.definition ? `<p class="context-definition">${escapeHtml(cleanDefinition(context.definition))}</p>` : ""}
                         <p class="context-translation">${escapeHtml(context.translation || "")}</p>
                     </div>` : ""}
             </div>
