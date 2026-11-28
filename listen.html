@@ -13,7 +13,7 @@
     <link rel="manifest" href="listen.webmanifest">
     <link rel="icon" href="icons/icon-192.png">
     <link rel="apple-touch-icon" href="icons/icon-180.png">
-    <link rel="stylesheet" href="listen.css?v=6">
+    <link rel="stylesheet" href="listen.css?v=8">
 </head>
 
 <body>
@@ -29,11 +29,24 @@
                 <button type="button" class="mode" data-mode="both" role="radio">EN + PT</button>
             </div>
 
+            <button type="button" class="icon-button" id="openVideo" aria-label="Vídeo do YouTube" aria-pressed="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5zm6 2.2v6.6a.6.6 0 0 0 .9.5l5.2-3.3a.6.6 0 0 0 0-1L10.9 8.2a.6.6 0 0 0-.9.5z"/></svg>
+            </button>
+
             <button type="button" class="icon-button" id="openLibrary" aria-label="Minhas palavras">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h3v16H5zM10 4h3v16h-3zM15.2 4.6l2.9-.8 4 15.4-2.9.8z"/></svg>
                 <span class="badge" id="libraryCount" hidden>0</span>
             </button>
         </header>
+
+        <section class="video" id="videoPanel" hidden>
+            <form class="video-form" id="videoForm">
+                <input type="url" id="videoUrl" inputmode="url" placeholder="Cole o link do YouTube" autocomplete="off" autocapitalize="off" spellcheck="false">
+                <button type="submit">Abrir</button>
+            </form>
+            <div class="video-frame" id="videoFrame" hidden><div id="ytPlayer"></div></div>
+            <p class="video-status" id="videoStatus" hidden></p>
+        </section>
 
         <section class="captions" id="captions" aria-live="polite">
             <div class="empty" id="emptyState">
@@ -121,7 +134,7 @@
     </section>
 
 
-    <script src="listen.js?v=17"></script>
+    <script src="listen.js?v=18"></script>
 
 </body>
 
