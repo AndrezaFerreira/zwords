@@ -3,7 +3,7 @@
 // ============================================================
 
 const STATIC_CACHE =
-    "zwords-static-v20261128-listen5";
+    "zwords-static-v20261128-listen6";
 
 const MEDIA_CACHE =
     "zwords-media-v1";
@@ -170,6 +170,31 @@ self.addEventListener(
 
             event.respondWith(
                 staticRequest(
+                    event.request
+                )
+            );
+
+            return;
+        }
+
+
+        // ====================================================
+        // "OUVIR" CODE: network first, so fixes reach phones
+        // right away; the cached copy is only an offline fallback.
+        // ====================================================
+
+        if (
+            /\/listen\.(js|css|webmanifest)$/.test(
+                pathname
+            )
+            ||
+            pathname.endsWith(
+                "/data/listen/phrasal.json"
+            )
+        ) {
+
+            event.respondWith(
+                networkFirstRequest(
                     event.request
                 )
             );
@@ -365,6 +390,68 @@ async function staticRequest(
 
 
 // ============================================================
+// NETWORK FIRST (Ouvir page code)
+// ============================================================
+
+async function networkFirstRequest(
+    request
+) {
+
+    const cache =
+        await caches.open(
+            STATIC_CACHE
+        );
+
+    try {
+
+        const response =
+            await fetch(
+                request,
+                { cache: "no-cache" }
+            );
+
+        if (
+            response
+            &&
+            response.ok
+        ) {
+            await cache.put(
+                request,
+                response.clone()
+            );
+        }
+
+        return response;
+
+    } catch (
+        error
+    ) {
+
+        const cached =
+            await cache.match(
+                request,
+                {
+                    ignoreSearch:
+                        true
+                }
+            );
+
+        return cached || new Response(
+            "",
+            {
+                status:
+                    504,
+                statusText:
+                    "Offline resource unavailable"
+            }
+        );
+
+    }
+
+}
+
+
+// ============================================================
 // NAVIGATION
 // ============================================================
 
@@ -376,6 +463,12 @@ async function navigationRequest(
         await caches.open(
             STATIC_CACHE
         );
+
+    // The "Ouvir" page is its own document: never store it as index.html.
+    const pageKey =
+        new URL(request.url).pathname.endsWith("/listen.html")
+            ? "./listen.html"
+            : "./index.html";
 
 
     try {
@@ -393,7 +486,7 @@ async function navigationRequest(
         ) {
 
             await cache.put(
-                "./index.html",
+                pageKey,
                 response.clone()
             );
 
@@ -409,7 +502,7 @@ async function navigationRequest(
 
         const cachedPage =
             await cache.match(
-                "./index.html",
+                pageKey,
                 {
                     ignoreSearch:
                         true

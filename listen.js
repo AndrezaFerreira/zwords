@@ -105,6 +105,47 @@
         return out.filter(Boolean);
     }
 
+    const BREAK_BEFORE = new Set(["and", "but", "so", "because", "then", "or", "when", "while", "which", "if", "until", "although"]);
+
+    /**
+     * Breaks a long run-on transcript (Safari often returns whole paragraphs
+     * without punctuation) into subtitle-sized pieces, at natural joints.
+     */
+    function chunkSentence(text) {
+        const words = text.split(/\s+/).filter(Boolean);
+        if (words.length <= 24) return [text];
+        const out = [];
+        let current = [];
+        words.forEach(word => {
+            const bare = word.toLowerCase().replace(/[^a-z']/g, "");
+            const atJoint = current.length >= 10
+                && (BREAK_BEFORE.has(bare) || /[,;:]$/.test(current[current.length - 1]));
+            if (current.length >= 20 || atJoint) {
+                out.push(current.join(" "));
+                current = [];
+            }
+            current.push(word);
+        });
+        if (current.length) {
+            if (current.length < 5 && out.length) out[out.length - 1] += " " + current.join(" ");
+            else out.push(current.join(" "));
+        }
+        return out;
+    }
+
+    /** The subtitle-sized piece of `sentence` that holds word number `index`. */
+    function focusSentence(sentence, index) {
+        const pieces = chunkSentence(sentence);
+        if (pieces.length === 1) return { sentence, index };
+        let offset = 0;
+        for (const piece of pieces) {
+            const count = piece.split(/\s+/).filter(Boolean).length;
+            if (index < offset + count) return { sentence: piece, index: index - offset };
+            offset += count;
+        }
+        return { sentence, index };
+    }
+
     /** Whitespace chunks; `w` is the tappable word inside the chunk. */
     function tokenize(text) {
         return text.split(/\s+/).filter(Boolean).map(chunk => {
@@ -716,7 +757,7 @@
     // Bump whenever the way meanings/phrasal verbs are chosen improves: every
     // word already in the library is then re-checked automatically, so nobody
     // keeps studying a meaning the old logic got wrong.
-    const MEANING_VERSION = 2;
+    const MEANING_VERSION = 3;
 
     function newRecord(target, now) {
         return {
@@ -859,23 +900,32 @@
         const record = await Store.get(key);
         const context = record?.contexts.find(c => c.sentence === sentence);
         if (!context) return false;
-        const tokens = tokenize(sentence);
+        const fullTokens = tokenize(sentence);
         const first = normalizeWord(String(context.form).split(" ")[0]);
-        const index = Number.isInteger(context.tap) && tokens[context.tap]?.w
+        const fullIndex = Number.isInteger(context.tap) && fullTokens[context.tap]?.w
             ? context.tap
-            : tokens.findIndex(t => t.w === first);
-        if (index < 0) {
+            : fullTokens.findIndex(t => t.w === first);
+        if (fullIndex < 0) {
             context.mv = MEANING_VERSION;           // cannot locate the word: keep as is
             await Store.put(record);
             return false;
         }
+        // Long run-on transcripts are reduced to the piece around the word.
+        const focus = focusSentence(sentence, fullIndex);
+        const shortened = focus.sentence !== sentence;
+        const index = focus.index;
+        const tokens = tokenize(focus.sentence);
         const target = await resolveTarget(tokens, index);
-        const translation = context.translation || await Translate.sentence(sentence);
+        const translation = shortened
+            ? await Translate.sentence(focus.sentence)
+            : (context.translation || await Translate.sentence(sentence));
+        if (shortened && !translation) return false;                 // offline: try again later
         const meaning = await explainTarget(target, translation);
         if (!meaning.gloss && !meaning.definition) return false;   // offline: try again later
 
         const updated = {
             ...context,
+            sentence: focus.sentence,
             form: target.form,
             translation: translation || context.translation || "",
             gloss: meaning.gloss,
@@ -887,7 +937,10 @@
         };
 
         if (target.key === record.key) {
-            record.contexts = record.contexts.map(c => (c.sentence === sentence ? updated : c));
+            const duplicate = shortened && record.contexts.some(c => c.sentence === focus.sentence);
+            record.contexts = duplicate
+                ? record.contexts.filter(c => c.sentence !== sentence)
+                : record.contexts.map(c => (c.sentence === sentence ? updated : c));
             if (target.isPhrase) Object.assign(record, { phrase: true, lookup: target.lookup, senses: target.senses });
             await Store.put(record);
             return true;
@@ -898,7 +951,7 @@
         if (record.contexts.length) await Store.put(record);
         else await Store.del(record.key);
         const destination = (await Store.get(target.key)) || newRecord(target, context.at || new Date().toISOString());
-        if (!destination.contexts.some(c => c.sentence === sentence)) destination.contexts.push(updated);
+        if (!destination.contexts.some(c => c.sentence === focus.sentence)) destination.contexts.push(updated);
         await Store.put(destination);
         return true;
     }
@@ -978,7 +1031,7 @@
         const clean = text.replace(/\s+/g, " ").trim();
         if (!clean) return;
         els.empty.hidden = true;
-        splitSentences(clean).forEach(sentence => {
+        splitSentences(clean).flatMap(chunkSentence).forEach(sentence => {
             const line = { id: ++lineSeq, text: sentence, translation: Translate.cached(sentence), el: null };
             line.el = lineElement(sentence);
             line.el.dataset.id = line.id;
@@ -1087,10 +1140,15 @@
     }
 
     /** Tap → balloon with the meaning in context + saved to the library. Captions keep running. */
-    async function onWordTap(span, lineEl, sentence, translation) {
+    async function onWordTap(span, lineEl, fullSentence, fullTranslation) {
+        const tapped = Number(span.dataset.i);
+        if (tokenize(fullSentence)[tapped]?.w !== span.dataset.w) return;
+        const focus = focusSentence(fullSentence, tapped);
+        const sentence = focus.sentence;
+        const index = focus.index;
+        const offset = tapped - index;
+        const translation = sentence === fullSentence ? fullTranslation : null;
         const tokens = tokenize(sentence);
-        const index = Number(span.dataset.i);
-        if (!tokens[index] || tokens[index].w !== span.dataset.w) return;
         if (navigator.vibrate) navigator.vibrate(12);
         flash([span]);
         const bubble = Bubble.show(span);
@@ -1098,7 +1156,7 @@
         const target = await resolveTarget(tokens, index);
         target.tap = index;
         const spans = target.positions
-            .map(position => lineEl.querySelector(`.w[data-i="${position}"]`))
+            .map(position => lineEl.querySelector(`.w[data-i="${position + offset}"]`))
             .filter(Boolean);
         flash(spans);
         spans.forEach(el => el.classList.add("saved"));
@@ -1688,6 +1746,6 @@
     }
 
     // Exposed for automated tests only.
-    window.__zwordsListen = { refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
+    window.__zwordsListen = { chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
 
 })();
