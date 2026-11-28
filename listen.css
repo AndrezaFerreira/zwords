@@ -614,6 +614,40 @@ button {
     font-size: 1.05rem;
 }
 
+.translations {
+    padding: 14px 16px;
+    border-radius: 16px;
+    background: var(--surface);
+    line-height: 1.5;
+}
+
+.translations p {
+    margin: 0 0 6px;
+}
+
+.translations p:last-child {
+    margin-bottom: 0;
+}
+
+.translations em {
+    margin-right: 4px;
+    color: var(--text-3);
+    font-size: 0.82rem;
+    font-style: normal;
+}
+
+.translations strong {
+    color: var(--accent-text);
+}
+
+.bubble-text.words {
+    font-weight: 500;
+}
+
+.bubble-text strong {
+    font-weight: 800;
+}
+
 .section-label {
     margin: 22px 0 8px;
     color: var(--text-3);
