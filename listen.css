@@ -678,6 +678,13 @@ button {
     margin-bottom: 6px;
 }
 
+.source-note {
+    margin: 14px 0 0;
+    color: var(--text-3);
+    font-size: 0.75rem;
+    line-height: 1.4;
+}
+
 .senses em {
     color: var(--text-3);
     font-style: normal;
