@@ -713,20 +713,29 @@
         if (!els.library.hidden) renderLibrary();
     }
 
+    // Bump whenever the way meanings/phrasal verbs are chosen improves: every
+    // word already in the library is then re-checked automatically, so nobody
+    // keeps studying a meaning the old logic got wrong.
+    const MEANING_VERSION = 2;
+
+    function newRecord(target, now) {
+        return {
+            key: target.key,
+            headword: target.headword,
+            createdAt: now,
+            updatedAt: now,
+            box: 0,
+            due: Date.now(),
+            contexts: [],
+            ...(target.isPhrase ? { phrase: true, lookup: target.lookup, senses: target.senses } : {})
+        };
+    }
+
     /** One tap: saves immediately (no confirmation), meaning arrives after. */
     function saveTarget(target, sentence, translationPromise, meaningPromise) {
         saveChain = saveChain.then(async () => {
             const now = new Date().toISOString();
-            const record = (await Store.get(target.key)) || {
-                key: target.key,
-                headword: target.headword,
-                createdAt: now,
-                updatedAt: now,
-                box: 0,
-                due: Date.now(),
-                contexts: [],
-                ...(target.isPhrase ? { phrase: true, lookup: target.lookup, senses: target.senses } : {})
-            };
+            const record = (await Store.get(target.key)) || newRecord(target, now);
             record.updatedAt = now;
             if (!record.contexts.some(c => c.sentence === sentence)) {
                 record.contexts.push({
@@ -736,6 +745,7 @@
                     gloss: "",
                     definition: "",
                     pos: "",
+                    tap: target.tap,
                     at: now
                 });
             }
@@ -756,7 +766,8 @@
                             gloss: meaning.gloss,
                             definition: meaning.definition,
                             pos: meaning.pos,
-                            senseId: meaning.senseId
+                            senseId: meaning.senseId,
+                            mv: MEANING_VERSION
                         });
                     }
                     await Store.put(record);
@@ -792,7 +803,8 @@
                             gloss: meaning.gloss,
                             definition: meaning.definition,
                             pos: meaning.pos,
-                            senseId: meaning.senseId
+                            senseId: meaning.senseId,
+                            mv: MEANING_VERSION
                         });
                         if (!record.phrase && record.headword === record.key && meaning.headword) record.headword = meaning.headword;
                         changed = true;
@@ -814,6 +826,81 @@
         } finally {
             enriching.delete(key);
         }
+    }
+
+    let refreshing = false;
+
+    /** Re-checks words saved with an older meaning logic (see MEANING_VERSION). */
+    async function refreshOutdated() {
+        if (refreshing || !navigator.onLine) return;
+        refreshing = true;
+        let changed = false;
+        try {
+            const all = await Store.all();
+            for (const record of all) {
+                for (const context of record.contexts) {
+                    if ((context.mv || 1) >= MEANING_VERSION) continue;
+                    const done = saveChain.then(() => refreshContext(record.key, context.sentence));
+                    saveChain = done.catch(() => {});
+                    if (await done.catch(() => false)) changed = true;
+                }
+            }
+        } finally {
+            refreshing = false;
+        }
+        if (changed) {
+            await loadSavedForms();
+            if (!els.library.hidden) renderLibrary();
+            if (!els.detail.hidden) openDetail(els.detail.dataset.key);
+        }
+    }
+
+    async function refreshContext(key, sentence) {
+        const record = await Store.get(key);
+        const context = record?.contexts.find(c => c.sentence === sentence);
+        if (!context) return false;
+        const tokens = tokenize(sentence);
+        const first = normalizeWord(String(context.form).split(" ")[0]);
+        const index = Number.isInteger(context.tap) && tokens[context.tap]?.w
+            ? context.tap
+            : tokens.findIndex(t => t.w === first);
+        if (index < 0) {
+            context.mv = MEANING_VERSION;           // cannot locate the word: keep as is
+            await Store.put(record);
+            return false;
+        }
+        const target = await resolveTarget(tokens, index);
+        const translation = context.translation || await Translate.sentence(sentence);
+        const meaning = await explainTarget(target, translation);
+        if (!meaning.gloss && !meaning.definition) return false;   // offline: try again later
+
+        const updated = {
+            ...context,
+            form: target.form,
+            translation: translation || context.translation || "",
+            gloss: meaning.gloss,
+            definition: meaning.definition,
+            pos: meaning.pos,
+            senseId: meaning.senseId,
+            tap: index,
+            mv: MEANING_VERSION
+        };
+
+        if (target.key === record.key) {
+            record.contexts = record.contexts.map(c => (c.sentence === sentence ? updated : c));
+            if (target.isPhrase) Object.assign(record, { phrase: true, lookup: target.lookup, senses: target.senses });
+            await Store.put(record);
+            return true;
+        }
+
+        // It belongs to another entry now (e.g. "dug" → "dig around"): move it.
+        record.contexts = record.contexts.filter(c => c.sentence !== sentence);
+        if (record.contexts.length) await Store.put(record);
+        else await Store.del(record.key);
+        const destination = (await Store.get(target.key)) || newRecord(target, context.at || new Date().toISOString());
+        if (!destination.contexts.some(c => c.sentence === sentence)) destination.contexts.push(updated);
+        await Store.put(destination);
+        return true;
     }
 
     async function enrichPending() {
@@ -1009,6 +1096,7 @@
         const bubble = Bubble.show(span);
 
         const target = await resolveTarget(tokens, index);
+        target.tap = index;
         const spans = target.positions
             .map(position => lineEl.querySelector(`.w[data-i="${position}"]`))
             .filter(Boolean);
@@ -1360,7 +1448,7 @@
     $("openLibrary").addEventListener("click", async () => {
         await renderLibrary();
         openSheet(els.library);
-        enrichPending();
+        enrichPending().then(refreshOutdated);
     });
 
     $("closeLibrary").addEventListener("click", () => closeSheet(els.library));
@@ -1592,14 +1680,14 @@
 
     setMode(mode);
     checkSupport();
-    loadSavedForms().then(enrichPending);
-    window.addEventListener("online", enrichPending);
+    loadSavedForms().then(enrichPending).then(refreshOutdated);
+    window.addEventListener("online", () => enrichPending().then(refreshOutdated));
 
     if ("serviceWorker" in navigator) {
         navigator.serviceWorker.register("./service-worker.js?v=20260913-3").catch(() => {});
     }
 
     // Exposed for automated tests only.
-    window.__zwordsListen = { addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
+    window.__zwordsListen = { refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
 
 })();
