@@ -689,13 +689,14 @@
             const key = "m:" + text;
             if (cache.has(key)) return cache.get(key);
             return limited(async () => {
+                let result = null;
                 try {
-                    const result = (await google(text, false)).translation;
-                    remember(key, result);
-                    return result;
+                    result = (await google(text, false)).translation;
                 } catch (error) {
-                    return null;
+                    try { result = await myMemory(text); } catch (e) { result = null; }
                 }
+                if (result) remember(key, result);
+                return result;
             });
         }
 
@@ -963,7 +964,7 @@
     // Bump whenever the way meanings/phrasal verbs are chosen improves: every
     // word already in the library is then re-checked automatically, so nobody
     // keeps studying a meaning the old logic got wrong.
-    const MEANING_VERSION = 6;
+    const MEANING_VERSION = 6;   // (unchanged: gloss-less contexts are retried anyway)
 
     function newRecord(target, now) {
         return {
@@ -1127,7 +1128,7 @@
             const all = await Store.all();
             for (const record of all) {
                 for (const context of record.contexts) {
-                    if ((context.mv || 1) >= MEANING_VERSION) continue;
+                    if ((context.mv || 1) >= MEANING_VERSION && context.gloss) continue;
                     const done = saveChain.then(() => refreshContext(record.key, context.sentence));
                     saveChain = done.catch(() => {});
                     if (await done.catch(() => false)) changed = true;
@@ -1141,6 +1142,31 @@
             if (!els.library.hidden) renderLibrary();
             if (!els.detail.hidden) openDetail(els.detail.dataset.key);
         }
+        scheduleRetry();
+    }
+
+    let retryTimer = null;
+
+    async function pendingCount() {
+        const all = await Store.all();
+        return all.reduce((sum, r) => sum + r.contexts.filter(c => (c.mv || 1) < MEANING_VERSION || !c.gloss).length, 0);
+    }
+
+    /** While anything is still waiting for a translation, try again every 3 minutes. */
+    async function scheduleRetry() {
+        clearTimeout(retryTimer);
+        const pending = await pendingCount();
+        updatePendingNote(pending);
+        if (pending) retryTimer = setTimeout(() => refreshOutdated(), 3 * 60 * 1000);
+    }
+
+    function updatePendingNote(pending) {
+        const note = document.getElementById("pendingNote");
+        if (!note) return;
+        note.hidden = !pending;
+        note.textContent = pending
+            ? `${pending} tradução(ões) aguardando o tradutor. O site tenta de novo sozinho a cada poucos minutos.`
+            : "";
     }
 
     async function refreshContext(key, sentence) {
@@ -1171,7 +1197,18 @@
             : (context.translation || await Translate.sentence(sentence));
         if (shortened && !translation) return false;                 // offline: try again later
         const meaning = await explainTarget(target, translation);
-        if (!meaning.gloss) return false;                           // translator unavailable: try again later
+        if (!meaning.gloss) {
+            // Translator unavailable: try again later, but stop showing a wrong
+            // "meaning" that is only the English word itself.
+            const english = new Set([...String(context.form).split(" "), record.key].map(w => fold(w)));
+            const words = foldedWords(context.gloss, 1);
+            if (words.length && words.every(w => english.has(w))) {
+                context.gloss = "";
+                await Store.put(record);
+                return true;
+            }
+            return false;
+        }
 
         const updated = {
             ...context,
@@ -1762,6 +1799,7 @@
     $("openLibrary").addEventListener("click", async () => {
         await renderLibrary();
         openSheet(els.library);
+        pendingCount().then(updatePendingNote);
         enrichPending().then(refreshOutdated).then(ensureAllExtras);
     });
 
@@ -1799,7 +1837,9 @@
             <p class="section-label">${contexts.length === 1 ? "Onde você encontrou" : `${contexts.length} contextos reais`}</p>
             ${contexts.map(c => `
                 <article class="context">
-                    ${c.gloss ? `<p class="context-gloss">${escapeHtml(c.gloss)}${c.pos ? ` <span class="word-count">${escapeHtml(posLabel(c.pos))}</span>` : ""}</p>` : ""}
+                    ${c.gloss
+                        ? `<p class="context-gloss">${escapeHtml(c.gloss)}${c.pos ? ` <span class="word-count">${escapeHtml(posLabel(c.pos))}</span>` : ""}</p>`
+                        : `<p class="context-definition">Buscando a tradução neste contexto…</p>`}
                     ${c.definition ? `<p class="context-definition">${escapeHtml(c.definition)}</p>` : ""}
                     <p class="context-sentence">${highlightForm(c.sentence, c.form)}</p>
                     <p class="context-translation">${escapeHtml(c.translation || "Traduzindo… (precisa de internet)")}</p>
