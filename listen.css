@@ -500,6 +500,16 @@ button {
     outline: none;
 }
 
+.pending-note {
+    margin: 4px 16px 6px;
+    padding: 8px 12px;
+    border-radius: 10px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 0.8rem;
+    line-height: 1.35;
+}
+
 .word-list {
     flex: 1;
     overflow-y: auto;
