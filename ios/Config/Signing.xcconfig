@@ -1,0 +1,11 @@
+// ============================================================
+//  ZWords — configuração de assinatura
+//  Para instalar pelo Xcode com um Apple ID gratuito, altere
+//  ZW_BUNDLE_PREFIX para algo único (ex.: com.seunome.zwords)
+//  e preencha DEVELOPMENT_TEAM com o seu Team ID (ou escolha
+//  o time em Signing & Capabilities no Xcode).
+// ============================================================
+ZW_BUNDLE_PREFIX = com.zwords.live
+DEVELOPMENT_TEAM =
+CODE_SIGN_STYLE = Automatic
+APP_GROUP_ID = group.$(ZW_BUNDLE_PREFIX)

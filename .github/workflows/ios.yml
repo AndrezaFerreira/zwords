@@ -1,0 +1,95 @@
+name: iOS app
+
+on:
+  push:
+    branches: [ "claude/english-learning-ios-app-zuppdl", "main" ]
+    paths: [ "ios/**", ".github/workflows/ios.yml" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
+          xcodebuild -version
+
+      - name: Install tools
+        run: brew install xcodegen ldid
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Unit tests (simulator)
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)["devices"]
+          c=[x for r,l in d.items() if "iOS" in r for x in l if x["name"].startswith("iPhone")]
+          print(c[-1]["udid"])')
+          echo "Simulator: $UDID"
+          mkdir -p build
+          set -o pipefail
+          xcodebuild test -project ZWords.xcodeproj -scheme ZWords \
+            -destination "id=$UDID" -derivedDataPath build/test \
+            CODE_SIGNING_ALLOWED=NO | tee build/test.log | grep -E "error:|warning: .*ZWords|Test Case|Executed|\*\*" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" build/test.log
+
+      - name: Build for device (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build -project ZWords.xcodeproj -scheme ZWords -configuration Release \
+            -sdk iphoneos -destination "generic/platform=iOS" -derivedDataPath build/device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | grep -E "error:|\*\*" || true
+          test -d build/device/Build/Products/Release-iphoneos/ZWords.app
+
+      - name: Package IPA (for SideStore / AltStore / Sideloadly)
+        run: |
+          APP=build/device/Build/Products/Release-iphoneos/ZWords.app
+          GROUP="group.$(awk -F' = ' '/^ZW_BUNDLE_PREFIX/{print $2}' Config/Signing.xcconfig)"
+          echo "App group: $GROUP"
+          for target in app ext; do
+            cat > $target.entitlements <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.security.application-groups</key><array><string>$GROUP</string></array>
+          </dict></plist>
+          PLIST
+          done
+          ldid -Sext.entitlements "$APP/PlugIns/ZWordsBroadcast.appex/ZWordsBroadcast"
+          ldid -Sapp.entitlements "$APP/ZWords"
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          zip -qry ZWords.ipa Payload
+          ls -lh ZWords.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZWords-ipa
+          path: ios/ZWords.ipa
+
+      - name: Publish "ios-latest" release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete ios-latest --yes --cleanup-tag || true
+          gh release create ios-latest ZWords.ipa --prerelease --target "$GITHUB_SHA" \
+            --title "ZWords iOS (build mais recente)" \
+            --notes "IPA não assinada para instalar com SideStore, AltStore ou Sideloadly usando um Apple ID gratuito. Veja ios/README.md."

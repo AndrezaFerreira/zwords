@@ -1,0 +1,9 @@
+ZWords.xcodeproj/
+build/
+DerivedData/
+*.ipa
+Payload/
+ZWords/Info.plist
+ZWordsBroadcast/Info.plist
+ZWords/ZWords.entitlements
+ZWordsBroadcast/ZWordsBroadcast.entitlements
