@@ -541,6 +541,34 @@ button {
     font-weight: 650;
 }
 
+.word-pos,
+.detail-pos {
+    color: var(--text-3);
+    font-size: 0.78rem;
+    font-weight: 500;
+}
+
+.detail-pos {
+    margin: 2px 0 0;
+    font-size: 0.9rem;
+}
+
+.context-label {
+    margin-right: 4px;
+    color: var(--text-3);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.card-top {
+    margin: 0 0 8px;
+    color: var(--accent-text);
+    font-size: 1.1rem;
+    font-weight: 700;
+}
+
 .word-gloss {
     display: block;
     overflow: hidden;
