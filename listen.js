@@ -16,6 +16,9 @@
 
     "use strict";
 
+    // Shown in "Minhas palavras" and compared with the server on every load.
+    const APP_VERSION = "16";
+
     const $ = id => document.getElementById(id);
 
     const els = {
@@ -2195,6 +2198,37 @@
     if ("serviceWorker" in navigator) {
         navigator.serviceWorker.register("./service-worker.js?v=20260913-3").catch(() => {});
     }
+
+    const versionLabel = document.getElementById("appVersion");
+    if (versionLabel) versionLabel.textContent = `Versão ${APP_VERSION}`;
+
+    /**
+     * If the server has newer code than the copy this phone is running,
+     * drop every cached copy and reload once (no manual cache clearing).
+     */
+    async function ensureLatestVersion() {
+        if (!navigator.onLine) return;
+        try {
+            const response = await fetch(`listen.js?check=${Date.now()}`, { cache: "reload" });
+            if (!response.ok) return;
+            const latest = (await response.text()).match(/const APP_VERSION = "([^"]+)"/)?.[1];
+            if (!latest || latest === APP_VERSION) return;
+            const key = "zwl_reloaded_for";
+            if (sessionStorage.getItem(key) === latest) return;            // never loop
+            sessionStorage.setItem(key, latest);
+            if ("caches" in window) {
+                const names = await caches.keys();
+                await Promise.all(names.filter(n => n.startsWith("zwords-static")).map(n => caches.delete(n)));
+            }
+            const registrations = await navigator.serviceWorker?.getRegistrations?.() || [];
+            await Promise.all(registrations.map(r => r.update().catch(() => {})));
+            location.reload();
+        } catch (error) {
+            /* offline or blocked: try next time */
+        }
+    }
+
+    ensureLatestVersion();
 
     // Exposed for automated tests only.
     window.__zwordsListen = { Wiki, ensureExtras, newSenses, markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
