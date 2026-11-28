@@ -387,6 +387,8 @@
                         found = p;
                         break;
                     }
+                    // "dig around in…": a particle is not an object, so it cannot be skipped.
+                    if (SEPARABLE.has(w)) break;
                 }
                 if (found < 0) return null;
                 positions.push(found);
@@ -598,7 +600,22 @@
             return cache.get("s:" + text.trim()) || null;
         }
 
-        return { prepareOnDevice, sentence, word, cached };
+        /** Sentence translation keeping [markers] around the tapped expression. */
+        async function marked(text) {
+            const key = "m:" + text;
+            if (cache.has(key)) return cache.get(key);
+            return limited(async () => {
+                try {
+                    const result = (await google(text, false)).translation;
+                    remember(key, result);
+                    return result;
+                } catch (error) {
+                    return null;
+                }
+            });
+        }
+
+        return { prepareOnDevice, sentence, word, cached, marked };
     })();
 
 
@@ -638,10 +655,43 @@
         return { posHint: hint.pos, lead: hint.lead };
     }
 
+    /** "We sat on the [bank] of the river": brackets around the expression. */
+    function markSentence(tokens, first, last) {
+        return tokens.map((token, i) => {
+            let text = token.t;
+            if (i === first || i === last) {
+                const match = text.match(WORD_RE);
+                if (match) {
+                    const before = text.slice(0, match.index);
+                    const word = match[0];
+                    const after = text.slice(match.index + word.length);
+                    text = before + (i === first ? "[" : "") + word + (i === last ? "]" : "") + after;
+                }
+            }
+            return text;
+        }).join(" ");
+    }
+
+    /** What Google put inside the brackets: the expression's translation in this sentence. */
+    function extractMarked(translation) {
+        const found = String(translation || "").match(/\[([^\[\]]{1,80})\]/);
+        if (!found) return "";
+        const text = found[1].replace(/^[\s"“”'.,;:!?¿¡-]+|[\s"“”'.,;:!?¿¡-]+$/g, "");
+        return text && text.split(/\s+/).length <= 8 ? text : "";
+    }
+
+    /** Rejects a "translation" that is just the English words left untouched. */
+    function usefulMarked(text, englishTokens) {
+        if (!text) return "";
+        const english = new Set(englishTokens.map(t => t.w).filter(Boolean));
+        const words = foldedWords(text, 1);
+        return words.length && words.every(w => english.has(w)) ? "" : text;
+    }
+
     /** What a tap means: a phrasal verb/expression around the word, or the word itself. */
     async function resolveTarget(tokens, index) {
         const phrase = await Phrasal.find(tokens, index).catch(() => null);
-        if (phrase) return phrase;
+        if (phrase) return { ...phrase, tokens };
         const form = tokens[index].w;
         const { key, entry } = await Dict.lemma(form);
         const hint = contextHint(tokens, index);
@@ -654,7 +704,8 @@
             form,
             lookup: key,
             senses: entry ? entry[1] : [],
-            positions: [index]
+            positions: [index],
+            tokens
         };
     }
 
@@ -664,6 +715,13 @@
      * translation wins ("bank" + "margem do rio" → "margem").
      */
     async function explainTarget(target, sentenceTranslation) {
+        let contextual = "";
+        if (target.tokens && target.positions?.length) {
+            const first = target.positions[0];
+            const last = target.positions[target.positions.length - 1];
+            const markedTranslation = await Translate.marked(markSentence(target.tokens, first, last)).catch(() => null);
+            contextual = usefulMarked(extractMarked(markedTranslation), target.tokens.slice(first, last + 1));
+        }
         const translated = fold(sentenceTranslation);
         const translatedStems = new Set(contentWords(sentenceTranslation).map(stem));
 
@@ -685,7 +743,7 @@
             }) || null;
         }
 
-        let gloss = match?.term || "";
+        let gloss = contextual || match?.term || "";
         if (!gloss && target.lead) {
             // "I figure" → "eu acho": translating with the subject gives the verb sense.
             const phrase = await Translate.word(`${target.lead} ${target.form}`).catch(() => null);
@@ -702,18 +760,21 @@
         if (senses.length) {
             const glossStems = foldedWords(gloss, 3).map(stem);
             let best = -1;
+            let bestEvidence = 0;
             senses.forEach(candidate => {
                 const [pos, definition] = candidate;
                 const defStems = contentWords(definition).map(stem);
-                let score = 0;
-                defStems.forEach(s => { if (translatedStems.has(s)) score += 1; });
-                glossStems.forEach(s => { if (defStems.some(d => d.startsWith(s) || s.startsWith(d))) score += 3; });
+                let evidence = 0;
+                defStems.forEach(s => { if (translatedStems.has(s)) evidence += 1; });
+                glossStems.forEach(s => { if (defStems.some(d => d.startsWith(s) || s.startsWith(d))) evidence += 3; });
+                let score = evidence;
                 const wanted = (match?.pos || hinted).toLowerCase();
                 if (wanted && pos && wanted === String(pos).toLowerCase()) score += 2;
-                if (score > best) { best = score; sense = candidate; }
+                if (score > best) { best = score; bestEvidence = evidence; sense = candidate; }
             });
-            // Without evidence, showing a definition could be the wrong sense.
-            if (best <= 0 && senses.length > 1) sense = null;
+            // Only the words of the sentence count as evidence; the part of
+            // speech alone could still point to the wrong sense.
+            if (bestEvidence <= 0 && senses.length > 1) sense = null;
         }
 
         return {
@@ -774,7 +835,7 @@
     // Bump whenever the way meanings/phrasal verbs are chosen improves: every
     // word already in the library is then re-checked automatically, so nobody
     // keeps studying a meaning the old logic got wrong.
-    const MEANING_VERSION = 4;
+    const MEANING_VERSION = 5;
 
     function newRecord(target, now) {
         return {
@@ -1773,6 +1834,6 @@
     }
 
     // Exposed for automated tests only.
-    window.__zwordsListen = { chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
+    window.__zwordsListen = { markSentence, extractMarked, chunkSentence, focusSentence, refreshOutdated, MEANING_VERSION, addFinal, setInterim, explain, explainTarget, resolveTarget, Phrasal, Dict, Translate, Store, splitSentences, tokenize };
 
 })();
