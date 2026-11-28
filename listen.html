@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#f7f4fb" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#121214" media="(prefers-color-scheme: dark)">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="ZWords Ouvir">
+    <title>ZWords Ouvir</title>
+    <link rel="manifest" href="listen.webmanifest">
+    <link rel="icon" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/icon-180.png">
+    <link rel="stylesheet" href="listen.css?v=1">
+</head>
+
+<body>
+
+    <main class="listen" id="listenApp">
+
+        <header class="top">
+            <a class="top-back" href="./" aria-label="Voltar ao ZWords">Z</a>
+
+            <div class="modes" role="radiogroup" aria-label="Legendas">
+                <button type="button" class="mode" data-mode="en" role="radio">EN</button>
+                <button type="button" class="mode" data-mode="pt" role="radio">PT</button>
+                <button type="button" class="mode" data-mode="both" role="radio">EN + PT</button>
+            </div>
+
+            <button type="button" class="icon-button" id="openLibrary" aria-label="Minhas palavras">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h3v16H5zM10 4h3v16h-3zM15.2 4.6l2.9-.8 4 15.4-2.9.8z"/></svg>
+                <span class="badge" id="libraryCount" hidden>0</span>
+            </button>
+        </header>
+
+        <section class="captions" id="captions" aria-live="polite">
+            <div class="empty" id="emptyState">
+                <h1>Ouça. Leia. Toque.</h1>
+                <p>Toque no microfone e deixe o celular ouvir o inglês ao redor: conversas, aulas, vídeos em outro aparelho.</p>
+                <p>As legendas aparecem aqui. <strong>Toque em qualquer palavra</strong> para salvá-la com a frase, o significado e a tradução.</p>
+            </div>
+            <div class="lines" id="lines"></div>
+        </section>
+
+        <button type="button" class="live-pill" id="jumpLive" hidden>↓ Ao vivo</button>
+
+        <p class="notice" id="notice" hidden></p>
+
+        <footer class="controls">
+            <button type="button" class="mic" id="micButton" aria-label="Começar a ouvir">
+                <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-6a3.5 3.5 0 0 0-7 0v6A3.5 3.5 0 0 0 12 15Zm6-3.5a1 1 0 1 0-2 0 4 4 0 0 1-8 0 1 1 0 1 0-2 0 6 6 0 0 0 5 5.91V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.59a6 6 0 0 0 5-5.91Z"/></svg>
+                <svg class="stop-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>
+            </button>
+            <p class="mic-label" id="micLabel">Toque para ouvir</p>
+        </footer>
+
+        <div class="toast" id="toast" role="status" hidden></div>
+
+    </main>
+
+
+    <!-- LIBRARY -->
+    <section class="sheet" id="library" hidden aria-label="Minhas palavras">
+
+        <header class="sheet-top">
+            <button type="button" class="text-button" id="startReview">Revisar</button>
+            <h2>Minhas palavras</h2>
+            <button type="button" class="text-button strong" id="closeLibrary">OK</button>
+        </header>
+
+        <div class="search">
+            <input type="search" id="librarySearch" placeholder="Buscar palavra, frase ou significado" autocomplete="off" autocapitalize="off" spellcheck="false">
+        </div>
+
+        <ul class="word-list" id="wordList"></ul>
+
+        <div class="library-empty" id="libraryEmpty" hidden>
+            <p><strong>Nenhuma palavra ainda.</strong></p>
+            <p>Toque em uma palavra das legendas para salvá-la aqui, junto com a frase em que apareceu.</p>
+        </div>
+
+        <footer class="sheet-footer">
+            <button type="button" class="link-button" id="exportLibrary">Exportar cópia</button>
+            <label class="link-button">
+                Importar
+                <input type="file" id="importLibrary" accept="application/json" hidden>
+            </label>
+        </footer>
+
+    </section>
+
+
+    <!-- WORD DETAIL -->
+    <section class="sheet" id="detail" hidden aria-label="Palavra">
+
+        <header class="sheet-top">
+            <button type="button" class="text-button" id="closeDetail">‹ Voltar</button>
+            <h2></h2>
+            <button type="button" class="text-button danger" id="deleteWord">Apagar</button>
+        </header>
+
+        <div class="detail-body" id="detailBody"></div>
+
+    </section>
+
+
+    <!-- REVIEW -->
+    <section class="sheet" id="review" hidden aria-label="Revisão">
+
+        <header class="sheet-top">
+            <span></span>
+            <h2 id="reviewTitle">Revisão</h2>
+            <button type="button" class="text-button strong" id="closeReview">Fechar</button>
+        </header>
+
+        <div class="review-body" id="reviewBody"></div>
+
+    </section>
+
+
+    <script src="listen.js?v=1"></script>
+
+</body>
+
+</html>

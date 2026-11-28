@@ -1,0 +1,1294 @@
+// ============================================================
+// ZWORDS OUVIR -- live English captions from the microphone,
+// one-tap vocabulary with real context, pt-BR translation.
+//
+// Plain script, no build step (same as the rest of ZWords).
+//   * Speech:     Web Speech API (Safari on iPhone, Chrome on Android)
+//   * Translation: Chrome's on-device Translator when available,
+//                 otherwise free public endpoints (no key, no cost)
+//   * Meaning:    ZWords' own Portuguese dictionary (data/listen/*),
+//                 matched against the sentence translation to pick the
+//                 sense that fits the context
+//   * Storage:    IndexedDB on the device (no account, no server)
+// ============================================================
+
+(() => {
+
+    "use strict";
+
+    const $ = id => document.getElementById(id);
+
+    const els = {
+        app: $("listenApp"),
+        captions: $("captions"),
+        lines: $("lines"),
+        empty: $("emptyState"),
+        mic: $("micButton"),
+        micLabel: $("micLabel"),
+        notice: $("notice"),
+        toast: $("toast"),
+        jumpLive: $("jumpLive"),
+        libraryCount: $("libraryCount"),
+        library: $("library"),
+        librarySearch: $("librarySearch"),
+        wordList: $("wordList"),
+        libraryEmpty: $("libraryEmpty"),
+        detail: $("detail"),
+        detailBody: $("detailBody"),
+        review: $("review"),
+        reviewBody: $("reviewBody"),
+        reviewTitle: $("reviewTitle")
+    };
+
+
+    // ============================================================
+    // TEXT HELPERS
+    // ============================================================
+
+    const WORD_RE = /\p{L}+(?:['’\-]\p{L}+)*/u;
+
+    function escapeHtml(value) {
+        return String(value ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
+    }
+
+    function normalizeWord(word) {
+        return word.replace(/[’‘]/g, "'").toLowerCase();
+    }
+
+    function fold(text) {
+        return String(text || "")
+            .normalize("NFD")
+            .replace(/[̀-ͯ]/g, "")
+            .toLowerCase();
+    }
+
+    function foldedWords(text, minLength = 3) {
+        return fold(text).split(/[^a-z0-9]+/).filter(w => w.length >= minLength);
+    }
+
+    const PT_STOPWORDS = new Set((
+        "que uma uns umas dos das nos nas para com por pelo pela mais como seu sua seus suas ele ela eles elas "
+        + "nao sim algo alguem alguma algum coisa coisas geralmente especialmente outro outra muito pouco ser "
+        + "esta este isso isto aquele aquela onde quando quem qual voce eles tem ter foi sao era sobre entre "
+        + "ate sem mas pois tambem ainda forma modo pessoa pessoas usado usada fazer feito"
+    ).split(" "));
+
+    function contentWords(text) {
+        return foldedWords(text, 3).filter(w => !PT_STOPWORDS.has(w));
+    }
+
+    function stem(word) {
+        return word.length > 5 ? word.slice(0, word.length - 2) : word;
+    }
+
+    /** Splits recognized text into sentences without losing any word. */
+    function splitSentences(text) {
+        const out = [];
+        let start = 0;
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            if ((ch === "." || ch === "!" || ch === "?") && text[i + 1] === " " && /[A-Z"“]/.test(text[i + 2] || "")) {
+                out.push(text.slice(start, i + 1).trim());
+                start = i + 2;
+            }
+        }
+        const rest = text.slice(start).trim();
+        if (rest) out.push(rest);
+        return out.filter(Boolean);
+    }
+
+    /** Whitespace chunks; `w` is the tappable word inside the chunk. */
+    function tokenize(text) {
+        return text.split(/\s+/).filter(Boolean).map(chunk => {
+            const match = chunk.match(WORD_RE);
+            return { t: chunk, w: match ? normalizeWord(match[0]) : null };
+        });
+    }
+
+    function highlightForm(sentence, form) {
+        const safe = escapeHtml(sentence);
+        const pattern = form
+            .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+            .replace(/'/g, "['’]");
+        try {
+            return safe.replace(new RegExp(`(^|[^\\p{L}])(${pattern})(?![\\p{L}])`, "iu"), "$1<mark>$2</mark>");
+        } catch (error) {
+            return safe;
+        }
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function fetchWithTimeout(url, ms = 7000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), ms);
+        try {
+            return await fetch(url, { signal: controller.signal });
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+
+    // ============================================================
+    // STORAGE (IndexedDB, falls back to memory)
+    // ============================================================
+
+    const Store = (() => {
+        const DB_NAME = "zwords_listen_db";
+        const STORE = "vocab";
+        let dbPromise = null;
+        const memory = new Map();
+
+        function open() {
+            if (dbPromise) return dbPromise;
+            dbPromise = new Promise(resolve => {
+                try {
+                    const request = indexedDB.open(DB_NAME, 1);
+                    request.onupgradeneeded = () => {
+                        request.result.createObjectStore(STORE, { keyPath: "key" });
+                    };
+                    request.onsuccess = () => resolve(request.result);
+                    request.onerror = () => resolve(null);
+                } catch (error) {
+                    resolve(null);
+                }
+            });
+            return dbPromise;
+        }
+
+        async function run(mode, fn) {
+            const db = await open();
+            if (!db) return fn(null);
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(STORE, mode);
+                const result = fn(tx.objectStore(STORE));
+                tx.oncomplete = () => resolve(result && "result" in result ? result.result : undefined);
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+
+        return {
+            all: () => run("readonly", s => s ? s.getAll() : { result: [...memory.values()] }).then(r => r || []),
+            get: key => run("readonly", s => s ? s.get(key) : { result: memory.get(key) }),
+            put: record => run("readwrite", s => s ? s.put(record) : memory.set(record.key, record)),
+            del: key => run("readwrite", s => s ? s.delete(key) : memory.delete(key))
+        };
+    })();
+
+
+    // ============================================================
+    // DICTIONARY (ZWords pt-BR senses, sharded by 2 letters)
+    // ============================================================
+
+    const Dict = (() => {
+        const shards = new Map();
+        let formsPromise = null;
+
+        function shardName(key) {
+            const letters = key.replace(/[^a-z]/g, "").slice(0, 2);
+            if (letters.length === 2) return letters;
+            if (letters.length === 1) return letters + "_";
+            return "__";
+        }
+
+        function loadJson(url) {
+            return fetchWithTimeout(url, 10000)
+                .then(r => (r.ok ? r.json() : {}))
+                .catch(() => null);
+        }
+
+        function shard(key) {
+            const name = shardName(key);
+            if (!shards.has(name)) {
+                const promise = loadJson(`data/listen/${name}.json`).then(data => {
+                    if (data === null) shards.delete(name);   // offline: retry later
+                    return data || {};
+                });
+                shards.set(name, promise);
+            }
+            return shards.get(name);
+        }
+
+        function forms() {
+            if (!formsPromise) {
+                formsPromise = loadJson("data/listen/forms.json").then(data => {
+                    if (data === null) formsPromise = null;
+                    return data || {};
+                });
+            }
+            return formsPromise;
+        }
+
+        async function entry(key) {
+            const data = await shard(key);
+            return data[key] || null;
+        }
+
+        function candidates(w) {
+            const list = [w];
+            const add = c => { if (c && c.length > 1 && !list.includes(c)) list.push(c); };
+            const doubled = s => (s.length > 2 && s[s.length - 1] === s[s.length - 2] ? s.slice(0, -1) : null);
+            if (w.endsWith("'s")) add(w.slice(0, -2));
+            if (w.endsWith("s'")) add(w.slice(0, -1));
+            if (w.endsWith("ies")) add(w.slice(0, -3) + "y");
+            if (w.endsWith("es")) add(w.slice(0, -2));
+            if (w.endsWith("s") && !w.endsWith("ss")) add(w.slice(0, -1));
+            if (w.endsWith("ied")) add(w.slice(0, -3) + "y");
+            if (w.endsWith("ed")) {
+                const base = w.slice(0, -2);
+                add(base); add(base + "e"); add(doubled(base)); add(w.slice(0, -1));
+            }
+            if (w.endsWith("ing")) {
+                const base = w.slice(0, -3);
+                add(base); add(base + "e"); add(doubled(base));
+                if (base.endsWith("y")) add(base.slice(0, -1) + "ie");
+            }
+            if (w.endsWith("ier")) add(w.slice(0, -3) + "y");
+            if (w.endsWith("iest")) add(w.slice(0, -4) + "y");
+            if (w.endsWith("er")) { add(w.slice(0, -2)); add(w.slice(0, -1)); add(doubled(w.slice(0, -2))); }
+            if (w.endsWith("est")) { add(w.slice(0, -3)); add(w.slice(0, -2)); add(doubled(w.slice(0, -3))); }
+            return list;
+        }
+
+        /** Dictionary form of a word ("ran" → "run", "studies" → "study"). */
+        async function lemma(form) {
+            const w = normalizeWord(form);
+            if (w.includes("'") && !w.endsWith("'s")) {
+                return { key: w, entry: await entry(w) };   // contractions stay as they are
+            }
+            const irregular = (await forms())[w];
+            const list = candidates(w);
+            if (irregular) list.splice(1, 0, irregular);
+            for (const candidate of list) {
+                const found = await entry(candidate);
+                if (found && (candidate === w || candidate === irregular || candidate.length >= 3)) {
+                    return { key: candidate, entry: found };
+                }
+            }
+            return { key: w, entry: null };
+        }
+
+        return { lemma, entry };
+    })();
+
+
+    // ============================================================
+    // TRANSLATION (free; on-device when the browser offers it)
+    // ============================================================
+
+    const Translate = (() => {
+        const CACHE_KEY = "zwl_translation_cache_v1";
+        const cache = new Map();
+        let onDevice = null;
+        let googleBlockedUntil = 0;
+        let active = 0;
+        const waiting = [];
+
+        try {
+            const saved = JSON.parse(localStorage.getItem(CACHE_KEY) || "[]");
+            saved.forEach(([k, v]) => cache.set(k, v));
+        } catch (error) { /* ignore */ }
+
+        let persistTimer = null;
+        function persist() {
+            clearTimeout(persistTimer);
+            persistTimer = setTimeout(() => {
+                try {
+                    const entries = [...cache.entries()].slice(-1500);
+                    localStorage.setItem(CACHE_KEY, JSON.stringify(entries));
+                } catch (error) { /* quota: ignore */ }
+            }, 1500);
+        }
+
+        function remember(key, value) {
+            cache.delete(key);
+            cache.set(key, value);
+            persist();
+        }
+
+        async function limited(task) {
+            if (active >= 2) await new Promise(resolve => waiting.push(resolve));
+            active++;
+            try {
+                return await task();
+            } finally {
+                active--;
+                const next = waiting.shift();
+                if (next) next();
+            }
+        }
+
+        /** Call during a user gesture (download may need one). */
+        async function prepareOnDevice() {
+            if (onDevice || !("Translator" in self)) return;
+            try {
+                const options = { sourceLanguage: "en", targetLanguage: "pt" };
+                const availability = await self.Translator.availability(options);
+                if (availability === "unavailable") return;
+                onDevice = await self.Translator.create(options);
+            } catch (error) {
+                onDevice = null;
+            }
+        }
+
+        async function google(text, withDictionary) {
+            if (Date.now() < googleBlockedUntil) throw new Error("google paused");
+            const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=pt&dt=t"
+                + (withDictionary ? "&dt=bd" : "")
+                + "&q=" + encodeURIComponent(text);
+            const response = await fetchWithTimeout(url);
+            if (!response.ok) {
+                if (response.status === 429 || response.status >= 500) googleBlockedUntil = Date.now() + 5 * 60 * 1000;
+                throw new Error(`google ${response.status}`);
+            }
+            const data = await response.json();
+            const translation = (data[0] || []).map(part => part[0] || "").join("").trim();
+            const dictionary = Array.isArray(data[1])
+                ? data[1].map(group => ({ pos: group[0], terms: group[1] || [] }))
+                : [];
+            if (!translation) throw new Error("empty");
+            return { translation, dictionary };
+        }
+
+        async function myMemory(text) {
+            const url = "https://api.mymemory.translated.net/get?langpair=en|pt-BR&q=" + encodeURIComponent(text.slice(0, 480));
+            const response = await fetchWithTimeout(url);
+            const data = await response.json();
+            const result = data?.responseData?.translatedText;
+            if (data?.responseStatus !== 200 || !result || /MYMEMORY WARNING/i.test(result)) throw new Error("mymemory");
+            return result.trim();
+        }
+
+        async function sentence(text) {
+            const key = text.trim();
+            if (!key) return null;
+            if (cache.has("s:" + key)) return cache.get("s:" + key);
+            return limited(async () => {
+                if (cache.has("s:" + key)) return cache.get("s:" + key);
+                let result = null;
+                if (onDevice) {
+                    try { result = await onDevice.translate(key); } catch (error) { result = null; }
+                }
+                if (!result) {
+                    try { result = (await google(key, false)).translation; } catch (error) { result = null; }
+                }
+                if (!result) {
+                    try { result = await myMemory(key); } catch (error) { result = null; }
+                }
+                if (result) remember("s:" + key, result);
+                return result;
+            });
+        }
+
+        /** Translation of a single word plus its dictionary alternatives. */
+        async function word(text) {
+            const key = "w:" + text;
+            if (cache.has(key)) return cache.get(key);
+            return limited(async () => {
+                let result = null;
+                try {
+                    result = await google(text, true);
+                } catch (error) {
+                    let translation = null;
+                    if (onDevice) {
+                        try { translation = await onDevice.translate(text); } catch (e) { translation = null; }
+                    }
+                    if (!translation) {
+                        try { translation = await myMemory(text); } catch (e) { translation = null; }
+                    }
+                    if (translation) result = { translation, dictionary: [] };
+                }
+                if (result) remember(key, result);
+                return result;
+            });
+        }
+
+        function cached(text) {
+            return cache.get("s:" + text.trim()) || null;
+        }
+
+        return { prepareOnDevice, sentence, word, cached };
+    })();
+
+
+    // ============================================================
+    // MEANING IN CONTEXT
+    // ============================================================
+
+    const POS_PT = {
+        noun: "substantivo", verb: "verbo", adjective: "adjetivo", adverb: "advérbio",
+        pronoun: "pronome", preposition: "preposição", conjunction: "conjunção",
+        interjection: "interjeição", determiner: "determinante", article: "artigo",
+        "phrasal verb": "phrasal verb", abbreviation: "abreviação", exclamation: "exclamação"
+    };
+
+    function posLabel(pos) {
+        return POS_PT[String(pos || "").toLowerCase()] || pos || "";
+    }
+
+    /**
+     * Picks the Portuguese meaning that fits *this* sentence: the
+     * dictionary alternative that actually appears in the sentence
+     * translation wins ("bank" + "margem do rio" → "margem").
+     */
+    async function explain(form, sentence, sentenceTranslation) {
+        const { key, entry } = await Dict.lemma(form);
+        const translated = fold(sentenceTranslation);
+        const translatedStems = new Set(contentWords(sentenceTranslation).map(stem));
+
+        let info = await Translate.word(key);
+        if (!info && key !== normalizeWord(form)) info = await Translate.word(normalizeWord(form));
+
+        const options = [];
+        (info?.dictionary || []).forEach(group => group.terms.forEach(term => options.push({ term, pos: group.pos })));
+        if (info?.translation) options.push({ term: info.translation, pos: "" });
+
+        let match = null;
+        if (translated) {
+            match = options.find(({ term }) => {
+                const words = foldedWords(term, 3);
+                return words.length > 0 && words.every(w => translated.includes(stem(w)));
+            }) || null;
+        }
+
+        const gloss = (match?.term || info?.translation || options[0]?.term || "").toLowerCase();
+
+        let sense = null;
+        const senses = entry ? entry[1] : [];
+        if (senses.length) {
+            const glossStems = foldedWords(gloss, 3).map(stem);
+            let best = -1;
+            senses.forEach(candidate => {
+                const [pos, definition] = candidate;
+                const defStems = contentWords(definition).map(stem);
+                let score = 0;
+                defStems.forEach(s => { if (translatedStems.has(s)) score += 1; });
+                glossStems.forEach(s => { if (defStems.some(d => d.startsWith(s) || s.startsWith(d))) score += 3; });
+                if (match?.pos && pos && match.pos.toLowerCase() === String(pos).toLowerCase()) score += 2;
+                if (score > best) { best = score; sense = candidate; }
+            });
+        }
+
+        return {
+            key,
+            headword: entry ? entry[0] : key,
+            gloss,
+            pos: sense ? sense[0] : (match?.pos || ""),
+            definition: sense ? sense[1] : "",
+            senseId: sense ? sense[3] : ""
+        };
+    }
+
+
+    // ============================================================
+    // VOCABULARY
+    // ============================================================
+
+    const savedForms = new Set();
+    let saveChain = Promise.resolve();
+
+    async function loadSavedForms() {
+        const all = await Store.all();
+        savedForms.clear();
+        all.forEach(record => {
+            savedForms.add(record.key);
+            record.contexts.forEach(c => savedForms.add(normalizeWord(c.form)));
+        });
+        updateLibraryBadge(all.length);
+    }
+
+    function updateLibraryBadge(count) {
+        els.libraryCount.hidden = count === 0;
+        els.libraryCount.textContent = count > 99 ? "99+" : String(count);
+    }
+
+    function markSaved(form) {
+        savedForms.add(form);
+        const selector = `.w[data-w="${CSS.escape(form)}"]`;
+        els.lines.querySelectorAll(selector).forEach(el => el.classList.add("saved"));
+    }
+
+    /** One tap: saves immediately, enriches in the background. */
+    function saveWord(form, sentence, sentenceTranslation) {
+        markSaved(form);
+        showToast(form);
+        if (navigator.vibrate) navigator.vibrate(12);
+
+        saveChain = saveChain.then(async () => {
+            const { key, entry } = await Dict.lemma(form);
+            const now = new Date().toISOString();
+            const record = (await Store.get(key)) || {
+                key,
+                headword: entry ? entry[0] : key,
+                createdAt: now,
+                updatedAt: now,
+                box: 0,
+                due: Date.now(),
+                contexts: []
+            };
+            record.updatedAt = now;
+            let context = record.contexts.find(c => c.sentence === sentence);
+            if (!context) {
+                context = {
+                    form,
+                    sentence,
+                    translation: sentenceTranslation || "",
+                    gloss: "",
+                    definition: "",
+                    pos: "",
+                    at: now
+                };
+                record.contexts.push(context);
+            }
+            await Store.put(record);
+            savedForms.add(key);
+            updateLibraryBadge((await Store.all()).length);
+            enrich(record.key);
+        }).catch(error => console.error("save failed", error));
+    }
+
+    const enriching = new Set();
+
+    async function enrich(key) {
+        if (enriching.has(key)) return;
+        enriching.add(key);
+        try {
+            const record = await Store.get(key);
+            if (!record) return;
+            let changed = false;
+            for (const context of record.contexts) {
+                if (!context.translation) {
+                    const translation = await Translate.sentence(context.sentence);
+                    if (translation) { context.translation = translation; changed = true; }
+                }
+                if (!context.gloss && !context.definition) {
+                    const meaning = await explain(context.form, context.sentence, context.translation);
+                    if (meaning.gloss || meaning.definition) {
+                        Object.assign(context, {
+                            gloss: meaning.gloss,
+                            definition: meaning.definition,
+                            pos: meaning.pos,
+                            senseId: meaning.senseId
+                        });
+                        if (record.headword === record.key && meaning.headword) record.headword = meaning.headword;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                const latest = await Store.get(key);
+                if (latest) {
+                    // Keep contexts added meanwhile; overwrite only enriched fields.
+                    latest.contexts = latest.contexts.map(c => record.contexts.find(r => r.sentence === c.sentence) || c);
+                    latest.headword = record.headword;
+                    await Store.put(latest);
+                }
+                if (!els.detail.hidden && els.detail.dataset.key === key) openDetail(key);
+                if (!els.library.hidden) renderLibrary();
+            }
+        } catch (error) {
+            console.error("enrich failed", error);
+        } finally {
+            enriching.delete(key);
+        }
+    }
+
+    async function enrichPending() {
+        const all = await Store.all();
+        for (const record of all) {
+            if (record.contexts.some(c => !c.translation || (!c.gloss && !c.definition))) {
+                await enrich(record.key);
+            }
+        }
+    }
+
+
+    // ============================================================
+    // CAPTIONS
+    // ============================================================
+
+    const MAX_LINES = 300;
+    let mode = localStorage.getItem("zwl_mode") || "both";
+    let lineSeq = 0;
+    const lines = [];                 // { id, text, translation, el }
+    const interim = { text: "", translation: "", el: null, timer: null, requested: "" };
+    let followLive = true;
+
+    function lineElement(text, extraClass = "") {
+        const el = document.createElement("div");
+        el.className = "line " + extraClass;
+        const en = document.createElement("p");
+        en.className = "en";
+        fillWords(en, text);
+        const pt = document.createElement("p");
+        pt.className = "pt pending";
+        el.append(en, pt);
+        return el;
+    }
+
+    function fillWords(container, text) {
+        const fragment = document.createDocumentFragment();
+        tokenize(text).forEach((token, index) => {
+            if (index > 0) fragment.append(" ");
+            if (token.w) {
+                const span = document.createElement("span");
+                span.className = "w" + (savedForms.has(token.w) ? " saved" : "");
+                span.dataset.w = token.w;
+                span.textContent = token.t;
+                fragment.append(span);
+            } else {
+                fragment.append(token.t);
+            }
+        });
+        container.replaceChildren(fragment);
+    }
+
+    function setPt(el, text, translation) {
+        const pt = el.querySelector(".pt");
+        if (translation) {
+            pt.textContent = translation;
+            pt.classList.remove("pending");
+        } else {
+            pt.textContent = mode === "pt" ? text : "…";
+            pt.classList.add("pending");
+        }
+    }
+
+    function ensureInterimElement() {
+        if (!interim.el) {
+            interim.el = lineElement("", "interim");
+            interim.el.hidden = true;
+            els.lines.append(interim.el);
+        }
+        return interim.el;
+    }
+
+    function addFinal(text) {
+        const clean = text.replace(/\s+/g, " ").trim();
+        if (!clean) return;
+        els.empty.hidden = true;
+        splitSentences(clean).forEach(sentence => {
+            const line = { id: ++lineSeq, text: sentence, translation: Translate.cached(sentence), el: null };
+            line.el = lineElement(sentence);
+            line.el.dataset.id = line.id;
+            setPt(line.el, line.text, line.translation);
+            els.lines.insertBefore(line.el, ensureInterimElement());
+            lines.push(line);
+            if (!line.translation && mode !== "en") translateLine(line);
+        });
+        while (lines.length > MAX_LINES) {
+            const old = lines.shift();
+            old.el.remove();
+        }
+        markCurrent();
+        scrollToLive();
+    }
+
+    async function translateLine(line) {
+        const translation = await Translate.sentence(line.text);
+        if (!translation) return;
+        line.translation = translation;
+        if (line.el.isConnected) setPt(line.el, line.text, translation);
+    }
+
+    function setInterim(text) {
+        const el = ensureInterimElement();
+        const clean = text.replace(/\s+/g, " ").trim();
+        if (clean === interim.text) return;
+        interim.text = clean;
+        el.hidden = !clean;
+        if (clean) {
+            els.empty.hidden = true;
+            fillWords(el.querySelector(".en"), clean);
+            setPt(el, clean, interim.translation && interim.requested && clean.startsWith(interim.requested.slice(0, 12)) ? interim.translation : "");
+            scheduleInterimTranslation();
+        } else {
+            interim.translation = "";
+            interim.requested = "";
+        }
+        markCurrent();
+        scrollToLive();
+    }
+
+    function scheduleInterimTranslation() {
+        if (mode === "en") return;
+        clearTimeout(interim.timer);
+        interim.timer = setTimeout(async () => {
+            const text = interim.text;
+            if (!text || text.split(" ").length < 3) return;
+            interim.requested = text;
+            const translation = await Translate.sentence(text);
+            if (translation && interim.text.startsWith(text.slice(0, 12))) {
+                interim.translation = translation;
+                setPt(interim.el, interim.text, translation);
+            }
+        }, 900);
+    }
+
+    function markCurrent() {
+        els.lines.querySelectorAll(".line.current").forEach(el => el.classList.remove("current"));
+        const target = interim.text ? interim.el : lines[lines.length - 1]?.el;
+        target?.classList.add("current");
+    }
+
+    function scrollToLive(force = false) {
+        if (!followLive && !force) return;
+        requestAnimationFrame(() => {
+            els.captions.scrollTop = els.captions.scrollHeight;
+        });
+    }
+
+    els.captions.addEventListener("scroll", () => {
+        const distance = els.captions.scrollHeight - els.captions.scrollTop - els.captions.clientHeight;
+        followLive = distance < 80;
+        els.jumpLive.hidden = followLive || lines.length === 0;
+    }, { passive: true });
+
+    els.jumpLive.addEventListener("click", () => {
+        followLive = true;
+        els.jumpLive.hidden = true;
+        scrollToLive(true);
+    });
+
+    els.lines.addEventListener("click", event => {
+        const span = event.target.closest(".w");
+        if (!span) return;
+        const lineEl = span.closest(".line");
+        let sentence;
+        let translation;
+        if (lineEl === interim.el) {
+            sentence = interim.text;
+            translation = interim.translation;
+        } else {
+            const line = lines.find(l => String(l.id) === lineEl.dataset.id);
+            if (!line) return;
+            sentence = line.text;
+            translation = line.translation;
+        }
+        span.classList.add("flash");
+        setTimeout(() => span.classList.remove("flash"), 450);
+        saveWord(span.dataset.w, sentence, translation);
+    });
+
+    function setMode(next) {
+        mode = next;
+        localStorage.setItem("zwl_mode", mode);
+        els.app.classList.remove("mode-en", "mode-pt", "mode-both");
+        els.app.classList.add("mode-" + mode);
+        document.querySelectorAll(".mode").forEach(button => {
+            button.setAttribute("aria-checked", String(button.dataset.mode === mode));
+        });
+        lines.forEach(line => {
+            setPt(line.el, line.text, line.translation);
+            if (!line.translation && mode !== "en") translateLine(line);
+        });
+        if (interim.el && interim.text) setPt(interim.el, interim.text, interim.translation);
+    }
+
+    document.querySelectorAll(".mode").forEach(button => {
+        button.addEventListener("click", () => setMode(button.dataset.mode));
+    });
+
+
+    // ============================================================
+    // SPEECH RECOGNITION
+    // ============================================================
+
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent)
+        || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const isStandalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+
+    let listening = false;
+    let recognizer = null;
+    let lastFinal = "";
+    let restartTimer = null;
+    let quickRestarts = 0;
+    let lastStart = 0;
+    let wakeLock = null;
+
+    function showNotice(message) {
+        els.notice.textContent = message || "";
+        els.notice.hidden = !message;
+    }
+
+    function commitFinal(transcript) {
+        let text = transcript.trim();
+        if (!text) return;
+        // Chrome on Android repeats earlier final text in later results.
+        const folded = text.toLowerCase();
+        if (lastFinal) {
+            if (folded === lastFinal) return;
+            if (folded.startsWith(lastFinal)) text = text.slice(lastFinal.length).trim();
+        }
+        lastFinal = folded;
+        addFinal(text);
+    }
+
+    function createRecognizer() {
+        const r = new Recognition();
+        r.lang = "en-US";
+        r.continuous = true;
+        r.interimResults = true;
+        r.maxAlternatives = 1;
+
+        r.onresult = event => {
+            quickRestarts = 0;
+            let pending = "";
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const result = event.results[i];
+                const transcript = result[0]?.transcript || "";
+                if (result.isFinal) {
+                    commitFinal(transcript);
+                } else {
+                    pending += transcript;
+                }
+            }
+            let shown = pending.trim();
+            if (lastFinal && shown.toLowerCase().startsWith(lastFinal)) shown = shown.slice(lastFinal.length).trim();
+            setInterim(shown);
+        };
+
+        r.onerror = event => {
+            const error = event.error;
+            if (error === "not-allowed" || error === "service-not-allowed") {
+                stopListening();
+                showNotice(isIOS
+                    ? "Permita o Microfone e o Reconhecimento de Fala para o Safari: Ajustes › Apps › Safari › Microfone (e Ajustes › Privacidade › Reconhecimento de Fala)."
+                    : "Permita o microfone para este site (ícone de cadeado na barra de endereço) e tente de novo.");
+            } else if (error === "audio-capture") {
+                stopListening();
+                showNotice("Nenhum microfone disponível. Verifique se outro app está usando o microfone.");
+            } else if (error === "network") {
+                showNotice("Sem conexão: o reconhecimento de fala do navegador precisa de internet.");
+            } else if (error === "language-not-supported") {
+                stopListening();
+                showNotice("Este navegador não reconhece inglês (en-US).");
+            }
+        };
+
+        r.onend = () => {
+            if (interim.text) {
+                // Keep what was heard even if the engine stopped mid-phrase.
+                commitFinal(interim.text);
+                setInterim("");
+            }
+            recognizer = null;
+            if (!listening) return;
+            const quick = Date.now() - lastStart < 1500;
+            quickRestarts = quick ? quickRestarts + 1 : 0;
+            const delay = quickRestarts > 4 ? 2000 : 250;
+            clearTimeout(restartTimer);
+            restartTimer = setTimeout(startRecognizer, delay);
+        };
+
+        return r;
+    }
+
+    function startRecognizer() {
+        if (!listening || recognizer || document.hidden) return;
+        try {
+            recognizer = createRecognizer();
+            lastFinal = "";
+            lastStart = Date.now();
+            recognizer.start();
+        } catch (error) {
+            recognizer = null;
+            clearTimeout(restartTimer);
+            restartTimer = setTimeout(startRecognizer, 1000);
+        }
+    }
+
+    async function requestWakeLock() {
+        try {
+            if ("wakeLock" in navigator && !wakeLock) {
+                wakeLock = await navigator.wakeLock.request("screen");
+                wakeLock.addEventListener("release", () => { wakeLock = null; });
+            }
+        } catch (error) {
+            wakeLock = null;
+        }
+    }
+
+    function releaseWakeLock() {
+        wakeLock?.release().catch(() => {});
+        wakeLock = null;
+    }
+
+    function startListening() {
+        if (!Recognition) return;
+        listening = true;
+        showNotice("");
+        els.app.classList.add("listening");
+        els.mic.setAttribute("aria-label", "Parar de ouvir");
+        els.micLabel.textContent = "Ouvindo… toque para parar";
+        Translate.prepareOnDevice();
+        requestWakeLock();
+        startRecognizer();
+    }
+
+    function stopListening() {
+        listening = false;
+        clearTimeout(restartTimer);
+        els.app.classList.remove("listening");
+        els.mic.setAttribute("aria-label", "Começar a ouvir");
+        els.micLabel.textContent = "Toque para ouvir";
+        releaseWakeLock();
+        if (recognizer) {
+            try { recognizer.stop(); } catch (error) { /* ignore */ }
+        }
+    }
+
+    els.mic.addEventListener("click", () => {
+        if (listening) stopListening(); else startListening();
+    });
+
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden) return;
+        if (listening) {
+            requestWakeLock();
+            startRecognizer();
+        }
+    });
+
+    function checkSupport() {
+        if (!window.isSecureContext) {
+            showNotice("Abra esta página por https para usar o microfone.");
+            els.mic.disabled = true;
+            return;
+        }
+        if (Recognition) return;
+        els.mic.disabled = true;
+        els.mic.style.opacity = "0.4";
+        if (isIOS && isStandalone) {
+            showNotice("No app da tela de início o iPhone bloqueia o reconhecimento de fala. Abra esta página no Safari.");
+        } else if (isIOS) {
+            showNotice("Use o Safari para ouvir (navegadores dentro de outros apps, como Instagram, não têm reconhecimento de fala).");
+        } else {
+            showNotice("Este navegador não tem reconhecimento de fala. Use o Chrome (Android/computador) ou o Safari (iPhone).");
+        }
+    }
+
+
+    // ============================================================
+    // TOAST + SPEECH SYNTHESIS
+    // ============================================================
+
+    let toastTimer = null;
+
+    function showToast(word) {
+        els.toast.textContent = word;
+        els.toast.hidden = false;
+        els.toast.style.animation = "none";
+        void els.toast.offsetWidth;
+        els.toast.style.animation = "";
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => { els.toast.hidden = true; }, 1300);
+    }
+
+    function speak(text) {
+        if (!("speechSynthesis" in window)) return;
+        speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = "en-US";
+        utterance.rate = 0.9;
+        speechSynthesis.speak(utterance);
+    }
+
+
+    // ============================================================
+    // LIBRARY
+    // ============================================================
+
+    function latestGloss(record) {
+        const contexts = [...record.contexts].reverse();
+        const withMeaning = contexts.find(c => c.gloss || c.definition);
+        if (!withMeaning) return "…";
+        return withMeaning.gloss || withMeaning.definition;
+    }
+
+    async function renderLibrary() {
+        const all = await Store.all();
+        all.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+        updateLibraryBadge(all.length);
+        const query = fold(els.librarySearch.value.trim());
+        const filtered = query
+            ? all.filter(record => fold([
+                record.headword,
+                ...record.contexts.flatMap(c => [c.form, c.sentence, c.translation, c.gloss, c.definition])
+            ].join(" ")).includes(query))
+            : all;
+
+        els.libraryEmpty.hidden = all.length > 0;
+        els.wordList.innerHTML = filtered.map(record => `
+            <li>
+                <button type="button" class="word-item" data-key="${escapeHtml(record.key)}">
+                    <span class="word-main">
+                        <span class="word-head">${escapeHtml(record.headword)}</span>
+                        <span class="word-gloss">${escapeHtml(latestGloss(record))}</span>
+                    </span>
+                    ${record.contexts.length > 1 ? `<span class="word-count">${record.contexts.length}</span>` : ""}
+                </button>
+            </li>`).join("")
+            || (all.length ? `<li class="library-empty">Nada encontrado para “${escapeHtml(els.librarySearch.value)}”.</li>` : "");
+    }
+
+    function openSheet(sheet) {
+        sheet.hidden = false;
+    }
+
+    function closeSheet(sheet) {
+        sheet.hidden = true;
+    }
+
+    $("openLibrary").addEventListener("click", async () => {
+        await renderLibrary();
+        openSheet(els.library);
+        enrichPending();
+    });
+
+    $("closeLibrary").addEventListener("click", () => closeSheet(els.library));
+    els.librarySearch.addEventListener("input", renderLibrary);
+
+    els.wordList.addEventListener("click", event => {
+        const item = event.target.closest(".word-item");
+        if (item) openDetail(item.dataset.key);
+    });
+
+    async function openDetail(key) {
+        const record = await Store.get(key);
+        if (!record) {
+            closeSheet(els.detail);
+            return;
+        }
+        els.detail.dataset.key = key;
+        els.detail.querySelector("h2").textContent = "";
+        const contexts = [...record.contexts].reverse();
+        const entry = await Dict.entry(record.key).catch(() => null);
+
+        els.detailBody.innerHTML = `
+            <div class="detail-head">
+                <h3>${escapeHtml(record.headword)}</h3>
+                <button type="button" class="speak" data-speak="${escapeHtml(record.headword)}" aria-label="Ouvir pronúncia">🔊</button>
+            </div>
+
+            <p class="section-label">${contexts.length === 1 ? "Onde você encontrou" : `${contexts.length} contextos reais`}</p>
+            ${contexts.map(c => `
+                <article class="context">
+                    ${c.gloss ? `<p class="context-gloss">${escapeHtml(c.gloss)}${c.pos ? ` <span class="word-count">${escapeHtml(posLabel(c.pos))}</span>` : ""}</p>` : ""}
+                    ${c.definition ? `<p class="context-definition">${escapeHtml(c.definition)}</p>` : ""}
+                    <p class="context-sentence">${highlightForm(c.sentence, c.form)}</p>
+                    <p class="context-translation">${escapeHtml(c.translation || "Traduzindo… (precisa de internet)")}</p>
+                    <div class="context-meta">
+                        <span>${escapeHtml(new Date(c.at).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" }))}</span>
+                        <button type="button" data-remove="${escapeHtml(c.sentence)}">remover</button>
+                    </div>
+                </article>`).join("")}
+
+            ${entry ? `
+                <p class="section-label">Todos os sentidos no ZWords</p>
+                <ol class="senses">
+                    ${entry[1].map(([pos, definition]) => `<li>${escapeHtml(definition)} <em>${escapeHtml(posLabel(pos))}</em></li>`).join("")}
+                </ol>` : ""}
+        `;
+        openSheet(els.detail);
+    }
+
+    els.detailBody.addEventListener("click", async event => {
+        const speakButton = event.target.closest("[data-speak]");
+        if (speakButton) {
+            speak(speakButton.dataset.speak);
+            return;
+        }
+        const remove = event.target.closest("[data-remove]");
+        if (remove) {
+            const key = els.detail.dataset.key;
+            const record = await Store.get(key);
+            if (!record) return;
+            record.contexts = record.contexts.filter(c => c.sentence !== remove.dataset.remove);
+            if (record.contexts.length) {
+                await Store.put(record);
+                openDetail(key);
+            } else {
+                await Store.del(key);
+                closeSheet(els.detail);
+            }
+            await loadSavedForms();
+            renderLibrary();
+        }
+    });
+
+    $("closeDetail").addEventListener("click", () => closeSheet(els.detail));
+
+    $("deleteWord").addEventListener("click", async () => {
+        const key = els.detail.dataset.key;
+        const record = await Store.get(key);
+        if (!record || !confirm(`Apagar “${record.headword}” e todos os contextos?`)) return;
+        await Store.del(key);
+        closeSheet(els.detail);
+        await loadSavedForms();
+        els.lines.querySelectorAll(".w.saved").forEach(el => {
+            if (!savedForms.has(el.dataset.w)) el.classList.remove("saved");
+        });
+        renderLibrary();
+    });
+
+    $("exportLibrary").addEventListener("click", async () => {
+        const all = await Store.all();
+        const blob = new Blob([JSON.stringify({ app: "zwords-listen", version: 1, words: all }, null, 2)], { type: "application/json" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = `zwords-palavras-${new Date().toISOString().slice(0, 10)}.json`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 2000);
+    });
+
+    $("importLibrary").addEventListener("change", async event => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        try {
+            const data = JSON.parse(await file.text());
+            const words = Array.isArray(data) ? data : data.words;
+            let count = 0;
+            for (const incoming of words || []) {
+                if (!incoming?.key || !Array.isArray(incoming.contexts)) continue;
+                const existing = await Store.get(incoming.key);
+                if (existing) {
+                    incoming.contexts.forEach(c => {
+                        if (!existing.contexts.some(e => e.sentence === c.sentence)) existing.contexts.push(c);
+                    });
+                    await Store.put(existing);
+                } else {
+                    await Store.put(incoming);
+                }
+                count++;
+            }
+            await loadSavedForms();
+            renderLibrary();
+            alert(`${count} palavra(s) importada(s).`);
+        } catch (error) {
+            alert("Arquivo inválido.");
+        }
+        event.target.value = "";
+    });
+
+
+    // ============================================================
+    // REVIEW (spaced repetition with the real sentences)
+    // ============================================================
+
+    const INTERVAL_DAYS = [0, 1, 3, 7, 16, 35];
+    let reviewQueue = [];
+    let reviewDone = 0;
+    let revealed = false;
+
+    $("startReview").addEventListener("click", async () => {
+        const all = await Store.all();
+        reviewQueue = all.filter(r => (r.due || 0) <= Date.now()).sort((a, b) => (a.due || 0) - (b.due || 0));
+        reviewDone = 0;
+        revealed = false;
+        renderReview(all.length);
+        openSheet(els.review);
+    });
+
+    $("closeReview").addEventListener("click", () => {
+        closeSheet(els.review);
+        renderLibrary();
+    });
+
+    function renderReview(total = 0) {
+        const record = reviewQueue[0];
+        if (!record) {
+            els.reviewTitle.textContent = "Revisão";
+            els.reviewBody.innerHTML = `
+                <div class="review-done">
+                    <p><strong>${reviewDone ? "Revisão concluída 🎉" : "Tudo em dia"}</strong></p>
+                    <p>${reviewDone ? `${reviewDone} palavra(s) revisada(s).` : "Nenhuma palavra para revisar agora."}</p>
+                    ${total || reviewDone ? `<button type="button" class="text-button strong" id="reviewAll">Revisar todas mesmo assim</button>` : ""}
+                </div>`;
+            return;
+        }
+        els.reviewTitle.textContent = `${reviewQueue.length} restante(s)`;
+        const context = record.contexts[Math.floor(Math.random() * record.contexts.length)];
+        els.reviewBody.innerHTML = `
+            <div class="card">
+                <h3>${escapeHtml(record.headword)}
+                    <button type="button" class="speak" data-speak="${escapeHtml(record.headword)}" aria-label="Ouvir pronúncia">🔊</button>
+                </h3>
+                <p class="context-sentence">${highlightForm(context.sentence, context.form)}</p>
+                ${revealed ? `
+                    <div class="card-answer">
+                        ${context.gloss ? `<p class="context-gloss">${escapeHtml(context.gloss)}</p>` : ""}
+                        ${context.definition ? `<p class="context-definition">${escapeHtml(context.definition)}</p>` : ""}
+                        <p class="context-translation">${escapeHtml(context.translation || "")}</p>
+                    </div>` : ""}
+            </div>
+            <div class="review-actions">
+                ${revealed
+                    ? `<button type="button" class="again" data-answer="again">Não lembrei</button>
+                       <button type="button" class="good" data-answer="good">Lembrei</button>`
+                    : `<button type="button" data-answer="reveal">Mostrar significado</button>`}
+            </div>`;
+    }
+
+    els.reviewBody.addEventListener("click", async event => {
+        const speakButton = event.target.closest("[data-speak]");
+        if (speakButton) {
+            speak(speakButton.dataset.speak);
+            return;
+        }
+        if (event.target.id === "reviewAll") {
+            reviewQueue = (await Store.all()).sort(() => Math.random() - 0.5);
+            revealed = false;
+            renderReview();
+            return;
+        }
+        const answer = event.target.closest("[data-answer]")?.dataset.answer;
+        if (!answer) return;
+        if (answer === "reveal") {
+            revealed = true;
+            renderReview();
+            return;
+        }
+        const record = reviewQueue.shift();
+        const latest = await Store.get(record.key);
+        if (latest) {
+            if (answer === "good") {
+                latest.box = Math.min((latest.box || 0) + 1, INTERVAL_DAYS.length - 1);
+                latest.due = Date.now() + INTERVAL_DAYS[latest.box] * 86400000;
+            } else {
+                latest.box = 0;
+                latest.due = Date.now() + 10 * 60000;
+            }
+            await Store.put(latest);
+        }
+        reviewDone++;
+        revealed = false;
+        renderReview();
+    });
+
+
+    // ============================================================
+    // START
+    // ============================================================
+
+    setMode(mode);
+    checkSupport();
+    loadSavedForms().then(enrichPending);
+    window.addEventListener("online", enrichPending);
+
+    if ("serviceWorker" in navigator) {
+        navigator.serviceWorker.register("./service-worker.js?v=20260913-3").catch(() => {});
+    }
+
+    // Exposed for automated tests only.
+    window.__zwordsListen = { addFinal, setInterim, explain, Dict, Translate, Store, splitSentences, tokenize, saveWord };
+
+})();

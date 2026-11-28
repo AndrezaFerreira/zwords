@@ -2363,3 +2363,16 @@ input {
     }
 
 }
+
+/* ============================================================
+   OUVIR (link to the live captions page)
+   ============================================================ */
+
+a.collection-listen {
+    color: inherit;
+    text-decoration: none;
+}
+
+.collection-listen .collection-icon {
+    background: rgba(109, 69, 224, 0.12);
+}

@@ -1,0 +1,16 @@
+{
+    "name": "ZWords Ouvir",
+    "short_name": "Ouvir",
+    "description": "Legendas ao vivo em inglês com tradução e vocabulário com um toque.",
+    "id": "./listen.html",
+    "start_url": "./listen.html",
+    "scope": "./",
+    "display": "browser",
+    "background_color": "#f7f4fb",
+    "theme_color": "#f7f4fb",
+    "lang": "pt-BR",
+    "icons": [
+        { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+        { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+    ]
+}

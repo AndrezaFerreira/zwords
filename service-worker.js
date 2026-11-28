@@ -3,7 +3,7 @@
 // ============================================================
 
 const STATIC_CACHE =
-    "zwords-static-vb8139e8b5a";
+    "zwords-static-v20261128-listen1";
 
 const MEDIA_CACHE =
     "zwords-media-v1";
